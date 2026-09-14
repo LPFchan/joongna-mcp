@@ -1,8 +1,13 @@
 # Joongna MCP
 
-MCP server that fetches and parses Joongna's search and search-price pages. Both `joongna_search_price` and `joongna_search_keyword` return seller descriptions and full product-image links by default. The price tool also returns average/highest/lowest price and BID and EXECUTION price history. Configure via environment variables: `JOONGNA_AUTH_TOKEN` (optional comma-separated bearer tokens for `/mcp` auth), `JOONGNA_BASE_URL`, `JOONGNA_PRODUCT_API_BASE_URL`, `JOONGNA_CACHE_TTL_SECONDS`, `JOONGNA_TIMEOUT_SECONDS`, `JOONGNA_USER_AGENT`, `JOONGNA_PUBLIC_BASE_URL`, `JOONGNA_ALLOWED_HOSTS`, and `JOONGNA_ALLOWED_ORIGINS`. Run with `docker compose up --build` or `python -m joongna_mcp.server`.
+MCP server that fetches and parses Joongna's search and search-price pages. Both `joongna_search_price` and `joongna_search_keyword` return seller descriptions and full product-image links by default. The price tool also returns average/highest/lowest price and BID and EXECUTION price history. Configure via environment variables: `JOONGNA_BASE_URL`, `JOONGNA_PRODUCT_API_BASE_URL`, `JOONGNA_CACHE_TTL_SECONDS`, `JOONGNA_TIMEOUT_SECONDS`, `JOONGNA_USER_AGENT`, `JOONGNA_PUBLIC_BASE_URL`, `JOONGNA_ALLOWED_HOSTS`, and `JOONGNA_ALLOWED_ORIGINS`. Run with `docker compose up --build` or `python -m joongna_mcp.server`.
 
-The production Compose service leaves `JOONGNA_AUTH_TOKEN` unset because the public ChatGPT connector cannot use the server's fixed bearer-token authentication. The tools only read public Joongna listings. The service uses `restart: unless-stopped` so it returns after host and Docker restarts.
+The production endpoint is `https://joongna.lost.plus/mcp`. The shared Common
+Auth gateway protects it with the `joongna` scope. Send a Common Auth token as
+`Authorization: Bearer <token>` or `X-API-Key: <token>`. The backend does not
+authenticate requests itself and must remain bound to localhost behind the
+gateway. The Compose service uses `restart: unless-stopped` so it returns after
+host and Docker restarts.
 
 The HTTP endpoint uses the official MCP Python SDK v2 and supports the
 `2026-07-28` stateless protocol via `server/discover`, with a stateless legacy
