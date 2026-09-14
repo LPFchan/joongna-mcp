@@ -7,7 +7,8 @@ Auth gateway protects it with the `joongna` scope. Send a Common Auth token as
 `Authorization: Bearer <token>` or `X-API-Key: <token>`. The backend does not
 authenticate requests itself and must remain bound to localhost behind the
 gateway. The Compose service uses `restart: unless-stopped` so it returns after
-host and Docker restarts.
+host and Docker restarts. Standalone runs default to loopback; Compose
+explicitly binds `0.0.0.0` only inside its loopback-published Docker boundary.
 
 The HTTP endpoint uses the official MCP Python SDK v2 and supports the
 `2026-07-28` stateless protocol via `server/discover`, with a stateless legacy
