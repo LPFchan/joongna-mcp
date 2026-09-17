@@ -27,6 +27,25 @@ const PRODUCT_API_BASE_URL = "https://product-api.joongna.com";
 const KEYWORD_MAX_RETRIES = 3;
 const KEYWORD_RETRY_DELAY_MS = 2000;
 
+// --- protocol shim ------------------------------------------------------------
+
+// ChatGPT's MCP client now speaks protocol 2026-07-28, which the pinned SDK
+// (@modelcontextprotocol/sdk 1.30.0) does not recognize: its transport hard-400s
+// any request whose mcp-protocol-version header is not in its built-in list
+// (max 2025-11-25). Version negotiation on initialize is graceful (the server
+// responds with its own version and the client retries), so we only need to
+// accept the newer header long enough for negotiation to run. Treat any
+// unknown version as the SDK's latest and let it negotiate down.
+const SDK_LATEST_PROTOCOL_VERSION = "2025-11-25";
+
+function rewriteProtocolVersionHeader(request: Request): Request {
+  const version = request.headers.get("mcp-protocol-version");
+  if (version === null || version <= SDK_LATEST_PROTOCOL_VERSION) return request;
+  const headers = new Headers(request.headers);
+  headers.set("mcp-protocol-version", SDK_LATEST_PROTOCOL_VERSION);
+  return new Request(request, { headers });
+}
+
 // --- auth --------------------------------------------------------------------
 
 interface Identity {
@@ -1014,6 +1033,10 @@ export default {
         headers: { ...corsHeaders(origin), "content-type": "application/json", "www-authenticate": wwwAuthenticate(request) },
       });
     }
+
+    // Accept newer protocol-version headers (e.g. ChatGPT's 2026-07-28) that the
+    // pinned SDK would reject with 400; negotiation happens on initialize.
+    request = rewriteProtocolVersionHeader(request);
 
     // Stateless MCP: fresh server + transport per request (no session state).
     const server = buildServer(env);
