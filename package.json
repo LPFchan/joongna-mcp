@@ -9,8 +9,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.17.0",
-    "zod": "^3.23.8"
+    "@modelcontextprotocol/server": "^2.0.0",
+    "zod": "^4.2.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240909.0",

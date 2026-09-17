@@ -1,3 +1,5 @@
+import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
+
 // joongna-mcp Worker: MCP server on Cloudflare Workers, port of the Python
 // joongna-mcp (Joongna search-price scraper). Authenticates machine tokens
 // directly against Common Auth (whoami) instead of the loopback gateway.
@@ -7,9 +9,6 @@
 // module-level state does not persist across Worker requests; every tool
 // call fetches fresh data. The force_refresh parameter is accepted for
 // parity but is a no-op.
-
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
 
 export interface Env {
@@ -26,25 +25,6 @@ const DEFAULT_USER_AGENT =
 const PRODUCT_API_BASE_URL = "https://product-api.joongna.com";
 const KEYWORD_MAX_RETRIES = 3;
 const KEYWORD_RETRY_DELAY_MS = 2000;
-
-// --- protocol shim ------------------------------------------------------------
-
-// ChatGPT's MCP client now speaks protocol 2026-07-28, which the pinned SDK
-// (@modelcontextprotocol/sdk 1.30.0) does not recognize: its transport hard-400s
-// any request whose mcp-protocol-version header is not in its built-in list
-// (max 2025-11-25). Version negotiation on initialize is graceful (the server
-// responds with its own version and the client retries), so we only need to
-// accept the newer header long enough for negotiation to run. Treat any
-// unknown version as the SDK's latest and let it negotiate down.
-const SDK_LATEST_PROTOCOL_VERSION = "2025-11-25";
-
-function rewriteProtocolVersionHeader(request: Request): Request {
-  const version = request.headers.get("mcp-protocol-version");
-  if (version === null || version <= SDK_LATEST_PROTOCOL_VERSION) return request;
-  const headers = new Headers(request.headers);
-  headers.set("mcp-protocol-version", SDK_LATEST_PROTOCOL_VERSION);
-  return new Request(request, { headers });
-}
 
 // --- auth --------------------------------------------------------------------
 
@@ -898,59 +878,49 @@ function buildServer(env: Env): McpServer {
   const server = new McpServer({ name: "joongna-mcp", version: "0.1.0" });
   const config = clientConfigFromEnv(env);
 
-  server.tool(
-    "joongna_search_price",
-    "Return Joongna price data and listings with descriptions and product images.",
-    {
-      query: z.string().describe("Natural-language question or device name to search on Joongna"),
-      search_word: z
-        .string()
-        .optional()
-        .describe("Optional explicit Joongna search term override, ideally in Korean"),
-      max_listings: z
-        .number()
-        .int()
-        .min(1)
-        .max(20)
-        .default(10)
-        .describe("Maximum listings to return per dataset"),
-      force_refresh: z
-        .boolean()
-        .default(false)
-        .describe("Bypass the in-memory cache for this request"),
-    },
-    async ({ query, search_word, max_listings }) => {
-      const result = await searchPrice(config, { query, searchWord: search_word, maxListings: max_listings });
-      return text(result);
-    },
-  );
+  server.registerTool("joongna_search_price", { description: "Return Joongna price data and listings with descriptions and product images.", inputSchema: z.object({
+              query: z.string().describe("Natural-language question or device name to search on Joongna"),
+              search_word: z
+                .string()
+                .optional()
+                .describe("Optional explicit Joongna search term override, ideally in Korean"),
+              max_listings: z
+                .number()
+                .int()
+                .min(1)
+                .max(20)
+                .default(10)
+                .describe("Maximum listings to return per dataset"),
+              force_refresh: z
+                .boolean()
+                .default(false)
+                .describe("Bypass the in-memory cache for this request"),
+            }) }, async ({ query, search_word, max_listings }) => {
+              const result = await searchPrice(config, { query, searchWord: search_word, maxListings: max_listings });
+              return text(result);
+            });
 
-  server.tool(
-    "joongna_search_keyword",
-    "Return Joongna listings, including sold-out items, descriptions, and product images.",
-    {
-      query: z.string().describe("Product name to search for on Joongna"),
-      search_word: z
-        .string()
-        .optional()
-        .describe("Optional explicit Joongna search term override, ideally in Korean"),
-      max_listings: z
-        .number()
-        .int()
-        .min(1)
-        .max(100)
-        .default(20)
-        .describe("Maximum listings to return"),
-      force_refresh: z
-        .boolean()
-        .default(false)
-        .describe("Bypass the in-memory cache for this request"),
-    },
-    async ({ query, search_word, max_listings }) => {
-      const result = await searchKeyword(config, { query, searchWord: search_word, maxListings: max_listings });
-      return text(result);
-    },
-  );
+  server.registerTool("joongna_search_keyword", { description: "Return Joongna listings, including sold-out items, descriptions, and product images.", inputSchema: z.object({
+              query: z.string().describe("Product name to search for on Joongna"),
+              search_word: z
+                .string()
+                .optional()
+                .describe("Optional explicit Joongna search term override, ideally in Korean"),
+              max_listings: z
+                .number()
+                .int()
+                .min(1)
+                .max(100)
+                .default(20)
+                .describe("Maximum listings to return"),
+              force_refresh: z
+                .boolean()
+                .default(false)
+                .describe("Bypass the in-memory cache for this request"),
+            }) }, async ({ query, search_word, max_listings }) => {
+              const result = await searchKeyword(config, { query, searchWord: search_word, maxListings: max_listings });
+              return text(result);
+            });
 
   return server;
 }
@@ -1034,15 +1004,11 @@ export default {
       });
     }
 
-    // Accept newer protocol-version headers (e.g. ChatGPT's 2026-07-28) that the
-    // pinned SDK would reject with 400; negotiation happens on initialize.
-    request = rewriteProtocolVersionHeader(request);
-
-    // Stateless MCP: fresh server + transport per request (no session state).
-    const server = buildServer(env);
-    const transport = new WebStandardStreamableHTTPServerTransport();
-    await server.connect(transport);
-    const response = await transport.handleRequest(request);
+    // Dual-era MCP: createMcpHandler serves 2026-07-28 (stateless, per-request)
+    // and legacy 2025-era clients through the stateless handshake fallback.
+    // A fresh handler per request closes over env; each McpServer instance the
+    // factory builds is itself per-request.
+    const response = await createMcpHandler(() => buildServer(env)).fetch(request);
     // Attach CORS headers to the MCP response.
     const headers = new Headers(response.headers);
     for (const [k, v] of Object.entries(corsHeaders(origin))) headers.set(k, v);
