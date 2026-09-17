@@ -1,15 +1,70 @@
 # Joongna MCP
 
-MCP server that fetches and parses Joongna's search and search-price pages. Both `joongna_search_price` and `joongna_search_keyword` return seller descriptions and full product-image links by default. The price tool also returns average/highest/lowest price and BID and EXECUTION price history. Configure via environment variables: `JOONGNA_BASE_URL`, `JOONGNA_PRODUCT_API_BASE_URL`, `JOONGNA_CACHE_TTL_SECONDS`, `JOONGNA_TIMEOUT_SECONDS`, `JOONGNA_USER_AGENT`, `JOONGNA_PUBLIC_BASE_URL`, `JOONGNA_ALLOWED_HOSTS`, and `JOONGNA_ALLOWED_ORIGINS`. Run with `docker compose up --build` or `python -m joongna_mcp.server`.
+MCP server that fetches and parses Joongna's search and search-price pages.
+Both `joongna_search_price` and `joongna_search_keyword` return seller
+descriptions and full product-image links by default. The price tool also
+returns average/highest/lowest price and BID and EXECUTION price history.
 
-The production endpoint is `https://joongna.lost.plus/mcp`. The shared Common
-Auth gateway protects it with the `joongna` scope. Send a Common Auth token as
-`Authorization: Bearer <token>` or `X-API-Key: <token>`. The backend does not
-authenticate requests itself and must remain bound to localhost behind the
-gateway. The Compose service uses `restart: unless-stopped` so it returns after
-host and Docker restarts. Standalone runs default to loopback; Compose
-explicitly binds `0.0.0.0` only inside its loopback-published Docker boundary.
+Two runtimes:
 
-The HTTP endpoint uses the official MCP Python SDK v2 and supports the
-`2026-07-28` stateless protocol via `server/discover`, with a stateless legacy
-fallback for clients that still use `initialize`.
+- **Cloudflare Workers** (root) — the primary runtime. Runs on Cloudflare's
+  edge, survives OCI outages. Validates tokens directly against
+  auth.lost.plus using the `joongna` scope.
+- **Python** (`python/`) — local-dev fallback. Runs behind the Common Auth
+  gateway on loopback (`cd python && docker compose up --build`, or
+  `python -m joongna_mcp.server` from `python/`).
+
+The HTTP endpoint uses the MCP Streamable HTTP transport. The Python server
+uses the official MCP Python SDK v2 and supports the `2026-07-28` stateless
+protocol via `server/discover`, with a stateless legacy fallback for clients
+that still use `initialize`.
+
+Production authentication is provided directly by the Worker against Common
+Auth at `https://auth.lost.plus` using the `joongna` scope. Send a Common
+Auth token as `Authorization: Bearer <token>` or `X-API-Key: <token>`.
+
+## Caching difference vs the Python server
+
+The Python server keeps in-memory caches (search pages, keyword pages, and
+product details) with `JOONGNA_CACHE_TTL_SECONDS` (default 300). The Worker
+drops these caches: module-level state does not persist across Worker
+invocations, and there is no Workers KV binding. Every tool call fetches
+fresh data, so `from_cache` is always `false` and `force_refresh` is
+accepted for API parity but has no effect. `JOONGNA_CACHE_TTL_SECONDS` is
+only read by the Python fallback.
+
+## Tools
+
+- `joongna_search_price(query, search_word?, max_listings?, force_refresh?)`
+  — price summary, BID/EXECUTION price history, and available listings.
+  `max_listings`: 1–20, default 10.
+- `joongna_search_keyword(query, search_word?, max_listings?, force_refresh?)`
+  — full search listings, including sold-out items.
+  `max_listings`: 1–100, default 20.
+
+## Deploy (Worker)
+
+```sh
+npm install
+npx wrangler deploy
+```
+
+No secrets are required. Configuration lives in `wrangler.toml` `[vars]`:
+`AUTH_URL`, `TOKEN_SCOPE`, `JOONGNA_BASE_URL`,
+`JOONGNA_TIMEOUT_SECONDS`, and `JOONGNA_USER_AGENT`.
+
+## Usage
+
+```json
+{
+  "mcpServers": {
+    "joongna": {
+      "type": "remote",
+      "url": "https://joongna.lost.plus/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_TOKEN"
+      }
+    }
+  }
+}
+```
