@@ -19,9 +19,17 @@ uses the official MCP Python SDK v2 and supports the `2026-07-28` stateless
 protocol via `server/discover`, with a stateless legacy fallback for clients
 that still use `initialize`.
 
-Production authentication is provided directly by the Worker against Common
-Auth at `https://auth.lost.plus` using the `joongna` scope. Send a Common
-Auth token as `Authorization: Bearer <token>` or `X-API-Key: <token>`.
+Production authentication belongs to the `auth-gateway` Worker, which serves
+`joongna.lost.plus/mcp`, `/mcp/*`, `/healthz` and
+`/.well-known/oauth-protected-resource*` and reaches this route-less Worker over
+its `JOONGNA` service binding.
+
+Callers are unaffected: send a Common Auth token as
+`Authorization: Bearer <token>` or `X-API-Key: <token>` (scope `joongna`) to the
+same URL as before. The gateway validates it, strips it, and passes the caller
+down in `x-lost-plus-*` headers; this Worker reads those and never sees a token
+(`identity.ts`). `/healthz` is the gateway's answer now and returns `ok` as
+`text/plain` rather than `{"ok":true}` as JSON.
 
 ## Caching difference vs the Python server
 
@@ -71,8 +79,12 @@ npx wrangler deploy
 ```
 
 No secrets are required. Configuration lives in `wrangler.toml` `[vars]`:
-`AUTH_URL`, `TOKEN_SCOPE`, `JOONGNA_BASE_URL`,
-`JOONGNA_TIMEOUT_SECONDS`, and `JOONGNA_USER_AGENT`.
+`JOONGNA_BASE_URL`, `JOONGNA_TIMEOUT_SECONDS`, and `JOONGNA_USER_AGENT`.
+
+`AUTH_URL` and `TOKEN_SCOPE` are gone with the code that read them. The scope
+now lives in the gateway's route table at
+`auth/gateway/config/cloudflare.gateway.json`. This Worker also declares no
+routes; see the comment in `wrangler.toml` before restoring any.
 
 ## Usage
 
