@@ -5,41 +5,31 @@ Both `joongna_search_price` and `joongna_search_keyword` return seller
 descriptions and full product-image links by default. The price tool also
 returns average/highest/lowest price and BID and EXECUTION price history.
 
-Two runtimes:
+## Where it runs
 
-- **Cloudflare Workers** (root) — the primary runtime. Runs on Cloudflare's
-  edge, survives OCI outages. Validates tokens directly against
-  auth.lost.plus using the `joongna` scope.
-- **Python** (`python/`) — local-dev fallback. Runs behind the Common Auth
-  gateway on loopback (`cd python && docker compose up --build`, or
-  `python -m joongna_mcp.server` from `python/`).
+A Cloudflare Worker named `joongna-mcp` (`index.ts`, `wrangler.toml`). It
+holds no zone route of its own and is not on workers.dev. The only way in is
+the `JOONGNA` service binding declared by the `auth-gateway` Worker
+(`LPFchan/auth`, `gateway/wrangler.toml`), whose route table
+(`gateway/config/cloudflare.gateway.json`) maps `joongna.lost.plus` to this
+binding under the `mcp` policy with token scope `joongna`.
 
-The HTTP endpoint uses the MCP Streamable HTTP transport. The Python server
-uses the official MCP Python SDK v2 and supports the `2026-07-28` stateless
-protocol via `server/discover`, with a stateless legacy fallback for clients
-that still use `initialize`.
+The gateway holds these zone routes:
 
-Production authentication belongs to the `auth-gateway` Worker, which serves
-`joongna.lost.plus/mcp`, `/mcp/*`, `/healthz` and
-`/.well-known/oauth-protected-resource*` and reaches this route-less Worker over
-its `JOONGNA` service binding.
+| route | handled by |
+| --- | --- |
+| `joongna.lost.plus/mcp`, `/mcp/*` | forwarded here over the binding |
+| `joongna.lost.plus/healthz` | the gateway (`ok`, `text/plain`) |
+| `joongna.lost.plus/.well-known/oauth-protected-resource*` | the gateway |
 
-Callers are unaffected: send a Common Auth token as
-`Authorization: Bearer <token>` or `X-API-Key: <token>` (scope `joongna`) to the
-same URL as before. The gateway validates it, strips it, and passes the caller
-down in `x-lost-plus-*` headers; this Worker reads those and never sees a token
-(`identity.ts`). `/healthz` is the gateway's answer now and returns `ok` as
-`text/plain` rather than `{"ok":true}` as JSON.
+Authentication belongs to the gateway. It validates the Common Auth token,
+strips it, and forwards the caller as percent-encoded `x-lost-plus-{sub,
+email, name, role, encoding}` headers. This Worker reads those (`identity.ts`)
+and never sees a credential; a request without them is refused with a 500
+because it can only mean the deployment is wrong (see `refused()` in
+`index.ts`). There is no `AUTH_URL`, no token scope, and no secret here.
 
-## Caching difference vs the Python server
-
-The Python server keeps in-memory caches (search pages, keyword pages, and
-product details) with `JOONGNA_CACHE_TTL_SECONDS` (default 300). The Worker
-drops these caches: module-level state does not persist across Worker
-invocations, and there is no Workers KV binding. Every tool call fetches
-fresh data, so `from_cache` is always `false` and `force_refresh` is
-accepted for API parity but has no effect. `JOONGNA_CACHE_TTL_SECONDS` is
-only read by the Python fallback.
+It holds no state: no D1, KV, or R2. Every tool call fetches Joongna fresh.
 
 ## Tools
 
@@ -49,6 +39,25 @@ only read by the Python fallback.
 - `joongna_search_keyword(query, search_word?, max_listings?, force_refresh?)`
   — full search listings, including sold-out items.
   `max_listings`: 1–100, default 20.
+
+`query` is normalized into a Joongna search word (English device names are
+translated, English filler is stripped, spaces are removed); pass
+`search_word` to use an exact term instead. `force_refresh` is accepted for
+compatibility with earlier clients and does nothing: there is no cache, and
+`from_cache` is always `false`.
+
+Each listing is enriched with the seller's description and full-size image
+URLs from Joongna's product API, one request per unique listing. If that
+request fails the listing keeps its search thumbnail and a `null`
+description; the search itself still succeeds. Joongna errors (non-200,
+non-HTML, suspected anti-bot page) come back as MCP tool errors
+(`isError: true`) with the reason as text.
+
+The MCP transport is Streamable HTTP via `@modelcontextprotocol/server` v2,
+serving 2026-07-28 clients natively and 2025-era clients (`initialize`)
+through the SDK's stateless fallback. 2026-07-28 clients are told to cache
+`tools/list` and `server/discover` for five minutes (`cacheHints` in
+`index.ts`).
 
 ## Listing sale status
 
@@ -71,20 +80,32 @@ Note that Joongna's product detail API uses a different scale for the same
 idea (search `state: 3` is `productStatus: 9` there), so the two are not
 interchangeable.
 
-## Deploy (Worker)
+## Develop
 
 ```sh
 npm install
-npx wrangler deploy
+npm test            # vitest: parser/normalizer fixtures, identity parsing, refusal path, MCP handshakes, tool calls against a fake Joongna
+npm run typecheck
 ```
 
-No secrets are required. Configuration lives in `wrangler.toml` `[vars]`:
-`JOONGNA_BASE_URL`, `JOONGNA_TIMEOUT_SECONDS`, and `JOONGNA_USER_AGENT`.
+## Deploy
 
-`AUTH_URL` and `TOKEN_SCOPE` are gone with the code that read them. The scope
-now lives in the gateway's route table at
-`auth/gateway/config/cloudflare.gateway.json`. This Worker also declares no
-routes; see the comment in `wrangler.toml` before restoring any.
+```sh
+CLOUDFLARE_API_TOKEN=… npm run deploy     # wrangler deploy
+```
+
+Configuration is the `[vars]` block in `wrangler.toml` (`JOONGNA_BASE_URL`,
+`JOONGNA_TIMEOUT_SECONDS`, `JOONGNA_USER_AGENT`). There are no secrets and
+no `.dev.vars`. Do not add `routes` to `wrangler.toml`: deploying would take
+the hostname away from the gateway (the comment there explains).
+
+To verify a deploy, call the public URL with a Common Auth token that has the
+`joongna` scope: `initialize` should return 200, and a bogus bearer should get
+a 401 with a `WWW-Authenticate` challenge from the gateway.
+
+Roll back with `npx wrangler rollback` (Cloudflare keeps the previous
+versions). If the gateway side is what broke, that is the auth repo's
+rollback, not this one's.
 
 ## Usage
 
@@ -101,3 +122,13 @@ routes; see the comment in `wrangler.toml` before restoring any.
   }
 }
 ```
+
+`X-API-Key: YOUR_TOKEN` works too. The token needs the `joongna` scope.
+
+## History
+
+Until 2026-09-18 this ran as a Python container (`python/`, FastMCP, port 8000
+on OCI behind the local auth gateway and the Cloudflare tunnel). The Worker
+port replaced it; the Python tree was deleted once its tests were carried
+over to `test/`. The Python server kept five-minute in-memory caches, which
+the Worker does not.

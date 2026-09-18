@@ -152,6 +152,18 @@ describe("MCP handshake", () => {
     });
   }
 
+  it("accepts POST /mcp/ with a trailing slash, as the gateway's /mcp/* route allows", async () => {
+    const response = await worker.fetch(
+      new Request("https://joongna.lost.plus/mcp/", {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json, text/event-stream", ...IDENTITY },
+        body: JSON.stringify(initialize("2025-06-18")),
+      }),
+      env,
+    );
+    expect(response.status).toBe(200);
+  });
+
   it("lists both tools for a 2025 client", async () => {
     const { json } = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }, { "mcp-protocol-version": "2025-06-18" });
     expect(json.result.tools.map((t: { name: string }) => t.name)).toEqual([

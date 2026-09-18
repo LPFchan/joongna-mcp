@@ -1,18 +1,19 @@
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 
-// joongna-mcp Worker: MCP server on Cloudflare Workers, port of the Python
-// joongna-mcp (Joongna search-price scraper).
+// joongna-mcp Worker: MCP server that scrapes Joongna's search and
+// search-price pages. Ported from the Python container that ran on OCI until
+// 2026-09; the parser and normalizer keep its behavior.
 //
 // A route-less backend behind the gateway Worker. It authenticates nobody:
 // the gateway has already asked auth.lost.plus who the caller is, and hands
 // the answer over in x-lost-plus-* headers. See identity.ts, and the routes
 // comment in wrangler.toml for why this Worker holds no route of its own.
 //
-// Note: the Python server keeps in-memory caches (JOONGNA_CACHE_TTL_SECONDS)
-// for search pages and product details. Those are dropped here because
-// module-level state does not persist across Worker requests; every tool
-// call fetches fresh data. The force_refresh parameter is accepted for
-// parity but is a no-op.
+// No caches. The Python server kept search pages and product details in
+// memory for five minutes; module-level state does not persist across Worker
+// requests, so every tool call fetches fresh data, `from_cache` is always
+// false, and `force_refresh` is accepted for API compatibility but does
+// nothing.
 import { z } from "zod";
 import { identityFrom } from "./identity";
 
@@ -237,11 +238,9 @@ async function fetchProductDetail(
 
 class JoongnaParseError extends Error {}
 
-// Mirrors _NEXT_FLIGHT_RE in python/src/joongna_mcp/parser.py.
 // Extracts the string literal out of self.__next_f.push([N,"..."]) calls.
 const NEXT_FLIGHT_RE = /self\.__next_f\.push\(\[\d+,\s*"((?:\\.|[^"\\])*)"\]\)/gs;
 
-// Mirrors _SUMMARY_RE.
 const SUMMARY_RE = />(평균 가격|가장 높은 가격|가장 낮은 가격)<\/span><span[^>]*>([^<]+)<\/span>/g;
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -349,7 +348,7 @@ function isObject(value: unknown): value is JsonObject {
 
 // Decode the string literal captured from a __next_f.push call. The captured
 // text is the raw contents of a JSON double-quoted string, so wrapping it in
-// quotes and running JSON.parse reproduces Python's json.loads(f'"{encoded}"').
+// quotes and running JSON.parse decodes it.
 function decodeFlightLiteral(encoded: string): string | null {
   try {
     return JSON.parse('"' + encoded + '"') as string;
