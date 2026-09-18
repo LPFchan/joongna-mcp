@@ -56,11 +56,12 @@ result says how many listings that happened to.
 
 The usual reason it happens is the platform: Cloudflare caps a Worker
 invocation at 50 subrequests on the free plan, shared between the search
-page and the detail fetches, so about 48 listings per call can be enriched
-(measured 2026-09-19: `joongna_search_keyword` with `max_listings=60`
-returns 60 listings, the first 48 with details, `detail_failures: 12`). Ask
-for at most 48 if every listing needs a description. The Python server had
-no such limit. Joongna errors (non-200,
+page and the detail fetches, so at most 49 listings per call can be enriched
+(fewer if the keyword search had to retry an empty page). Measured
+2026-09-19: `joongna_search_keyword` with `max_listings=60` returns 50
+listings (all Joongna's page carries), the first 49 with details,
+`detail_failures: 1`; `max_listings=40` reports 0. Ask for at most 49 if
+every listing needs a description. The Python server had no such limit. Joongna errors (non-200,
 non-HTML, suspected anti-bot page) come back as MCP tool errors
 (`isError: true`) with the reason as text.
 
