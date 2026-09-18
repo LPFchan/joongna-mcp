@@ -286,7 +286,17 @@ interface PriceHistoryDatasetData {
   listings: ListingData[];
 }
 
-interface SearchPriceResult {
+/**
+ * Listings whose product-detail request failed and so carry only search-page
+ * fields (description null, thumbnail only). Non-zero usually means the
+ * Workers per-invocation subrequest cap was hit: on the free plan that is 50,
+ * shared between the search page and the per-listing detail fetches, so
+ * roughly 48 listings per call can be enriched. The Python server had no
+ * such limit.
+ */
+type DetailFailures = { detail_failures: number };
+
+interface SearchPriceResult extends DetailFailures {
   query: string;
   search_word: string;
   source_url: string;
@@ -301,7 +311,7 @@ interface SearchPriceResult {
   available_listings: ListingData[];
 }
 
-interface SearchKeywordResult {
+interface SearchKeywordResult extends DetailFailures {
   query: string;
   search_word: string;
   source_url: string;
@@ -647,6 +657,7 @@ export function parseSearchPricePage(
     source_url: opts.sourceUrl,
     fetched_at: opts.fetchedAt,
     from_cache: false,
+    detail_failures: 0,
     empty_result: emptyResult,
     empty_result_reason: emptyResult ? "No pricing data found for this search word" : null,
     summary,
@@ -672,6 +683,7 @@ export function parseSearchKeywordPage(
     source_url: opts.sourceUrl,
     fetched_at: opts.fetchedAt,
     from_cache: false,
+    detail_failures: 0,
     total_count: listings.length,
     listings,
   };
@@ -710,24 +722,24 @@ export function parseProductDetail(payload: JsonObject): { description: string |
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Null when the detail could not be fetched or parsed; the listing then keeps its search-page fields. */
 async function getListingDetails(
   config: ClientConfig,
   sequence: number,
-): Promise<{ description: string | null; image_urls: string[] }> {
+): Promise<{ description: string | null; image_urls: string[] } | null> {
   try {
     const payload = await fetchProductDetail(config, sequence);
     return parseProductDetail(payload);
   } catch (err) {
-    if (err instanceof JoongnaFetchError || err instanceof JoongnaParseError) {
-      return { description: null, image_urls: [] };
-    }
+    if (err instanceof JoongnaFetchError || err instanceof JoongnaParseError) return null;
     throw err;
   }
 }
 
-async function enrichListings(config: ClientConfig, listings: ListingData[]): Promise<void> {
+/** Enriches in place; returns how many unique listings could not be enriched. */
+async function enrichListings(config: ClientConfig, listings: ListingData[]): Promise<number> {
   const sequences = [...new Set(listings.map((listing) => listing.sequence))];
-  if (sequences.length === 0) return;
+  if (sequences.length === 0) return 0;
 
   const detailsList = await Promise.all(
     sequences.map((sequence) => getListingDetails(config, sequence)),
@@ -742,6 +754,7 @@ async function enrichListings(config: ClientConfig, listings: ListingData[]): Pr
       listing.image_urls = [...details.image_urls];
     }
   }
+  return detailsList.filter((details) => details === null).length;
 }
 
 function limitPriceResult(result: SearchPriceResult, maxListings: number): SearchPriceResult {
@@ -781,7 +794,7 @@ async function searchPrice(
   const groups: ListingData[] = [...limited.available_listings];
   if (limited.registered_price_history) groups.push(...limited.registered_price_history.listings);
   if (limited.sold_price_history) groups.push(...limited.sold_price_history.listings);
-  await enrichListings(config, groups);
+  limited.detail_failures = await enrichListings(config, groups);
   return limited;
 }
 
@@ -808,7 +821,7 @@ async function searchKeyword(
   }
 
   const limited = limitKeywordResult(result as SearchKeywordResult, args.maxListings);
-  await enrichListings(config, limited.listings);
+  limited.detail_failures = await enrichListings(config, limited.listings);
   return limited;
 }
 
@@ -836,7 +849,7 @@ function buildServer(env: Env): McpServer {
   );
   const config = clientConfigFromEnv(env);
 
-  server.registerTool("joongna_search_price", { description: "Return Joongna price data and listings with descriptions and product images.", inputSchema: z.object({
+  server.registerTool("joongna_search_price", { description: "Return Joongna price data and listings with descriptions and product images. Descriptions and images cost one upstream request per listing; on the current Workers plan about 48 listings per call can be enriched, and detail_failures in the result counts the ones that were not.", inputSchema: z.object({
               query: z.string().describe("Natural-language question or device name to search on Joongna"),
               search_word: z
                 .string()
@@ -858,7 +871,7 @@ function buildServer(env: Env): McpServer {
               return text(result);
             });
 
-  server.registerTool("joongna_search_keyword", { description: "Return Joongna listings, including sold-out items, descriptions, and product images.", inputSchema: z.object({
+  server.registerTool("joongna_search_keyword", { description: "Return Joongna listings, including sold-out items, descriptions, and product images. Descriptions and images cost one upstream request per listing; on the current Workers plan about 48 listings per call can be enriched, and detail_failures in the result counts the ones that were not.", inputSchema: z.object({
               query: z.string().describe("Product name to search for on Joongna"),
               search_word: z
                 .string()

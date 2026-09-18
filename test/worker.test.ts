@@ -339,6 +339,37 @@ describe("tool calls", () => {
     const result = JSON.parse(json.result.content[0].text);
     expect(result.listings[0].description).toBeNull();
     expect(result.listings[0].image_urls).toEqual(["https://img2.joongna.com/search-thumbnail.jpg"]);
+    expect(result.detail_failures).toBe(1);
     expect(joongna.calls).toHaveLength(1); // the page; the detail call never reached the fake
+  });
+
+  it("counts how many unique listings could not be detail-enriched", async () => {
+    // What the Workers subrequest cap looks like from inside: the first
+    // detail fetches succeed and the rest throw. The search must still
+    // succeed, and the count must say how much of the tail is thumbnail-only.
+    const items = Array.from({ length: 5 }, (_, i) => ({ ...LISTING, seq: 1000 + i }));
+    let detailCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("product-api")) {
+        detailCalls++;
+        if (detailCalls > 3) throw new TypeError("Too many subrequests.");
+        return Response.json(PRODUCT_DETAIL);
+      }
+      return html(nextChunk({ items }));
+    }));
+
+    const { json } = await callTool("joongna_search_keyword", { query: "아이폰13미니" });
+    expect(json.result.isError).toBeUndefined();
+    const result = JSON.parse(json.result.content[0].text);
+    expect(result.total_count).toBe(5);
+    expect(result.detail_failures).toBe(2);
+    expect(result.listings.filter((l: { description: string | null }) => l.description === null)).toHaveLength(2);
+  });
+
+  it("reports zero detail failures when every detail fetch succeeds", async () => {
+    fakeJoongna();
+    const { json } = await callTool("joongna_search_price", { query: "아이폰13미니" });
+    expect(JSON.parse(json.result.content[0].text).detail_failures).toBe(0);
   });
 });
