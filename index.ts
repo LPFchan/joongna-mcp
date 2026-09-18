@@ -31,52 +31,65 @@ const KEYWORD_RETRY_DELAY_MS = 2000;
 
 // --- normalize ---------------------------------------------------------------
 
+// A whole-word match with the boundary the Python original had. Python's `\b`
+// counts any Unicode letter as a word character, so `pro` in "맥북pro" is not
+// a word of its own there; JavaScript's `\b` is ASCII-only and would split it.
+// The lookarounds reproduce the Python boundary so "맥북pro" and "아이폰a"
+// normalize the same way they did.
+const WORD_START = "(?<![\\p{L}\\p{N}_])";
+const WORD_END = "(?![\\p{L}\\p{N}_])";
+function word(pattern: string): RegExp {
+  return new RegExp(WORD_START + pattern + WORD_END, "gu");
+}
+
 const PHRASE_REPLACEMENTS: Array<[RegExp, string]> = [
-  [/\bapple watch\b/g, "애플워치"],
-  [/\bairpods max\b/g, "에어팟맥스"],
-  [/\bairpods pro\b/g, "에어팟프로"],
-  [/\bairpods\b/g, "에어팟"],
-  [/\bgalaxy z fold\b/g, "갤럭시z폴드"],
-  [/\bgalaxy z flip\b/g, "갤럭시z플립"],
-  [/\bgalaxy\b/g, "갤럭시"],
-  [/\biphone\b/g, "아이폰"],
-  [/\bipad\b/g, "아이패드"],
-  [/\bmacbook\b/g, "맥북"],
-  [/\bpro max\b/g, "프로맥스"],
-  [/\bplus\b/g, "플러스"],
-  [/\bultra\b/g, "울트라"],
-  [/\bmini\b/g, "미니"],
-  [/\bpro\b/g, "프로"],
-  [/\bmax\b/g, "맥스"],
+  [word("apple watch"), "애플워치"],
+  [word("airpods max"), "에어팟맥스"],
+  [word("airpods pro"), "에어팟프로"],
+  [word("airpods"), "에어팟"],
+  [word("galaxy z fold"), "갤럭시z폴드"],
+  [word("galaxy z flip"), "갤럭시z플립"],
+  [word("galaxy"), "갤럭시"],
+  [word("iphone"), "아이폰"],
+  [word("ipad"), "아이패드"],
+  [word("macbook"), "맥북"],
+  [word("pro max"), "프로맥스"],
+  [word("plus"), "플러스"],
+  [word("ultra"), "울트라"],
+  [word("mini"), "미니"],
+  [word("pro"), "프로"],
+  [word("max"), "맥스"],
 ];
 
 const NOISE_PATTERNS: RegExp[] = [
-  /\bhow much does\b/g,
-  /\bhow much do\b/g,
-  /\bhow much is\b/g,
-  /\bhow much are\b/g,
-  /\bhow much\b/g,
-  /\bwhat is the price of\b/g,
-  /\bprice of\b/g,
-  /\bgoing for\b/g,
-  /\bgo for\b/g,
-  /\bgo these days\b/g,
-  /\bthese days\b/g,
-  /\bworth\b/g,
-  /\bselling for\b/g,
-  /\bused\b/g,
-  /\bsecond hand\b/g,
-  /\bprice\b/g,
-  /\bcurrent\b/g,
-  /\bdoes\b/g,
-  /\bdo\b/g,
-  /\bis\b/g,
-  /\bare\b/g,
-  /\bfor\b/g,
-  /\bthe\b/g,
-  /\ba\b/g,
-  /\ban\b/g,
-];
+  "how much does",
+  "how much do",
+  "how much is",
+  "how much are",
+  "how much",
+  "what is the price of",
+  "price of",
+  "going for",
+  "go for",
+  "go these days",
+  "these days",
+  "worth",
+  "selling for",
+  "used",
+  "second hand",
+  "price",
+  "current",
+  "does",
+  "do",
+  "is",
+  "are",
+  "for",
+  "the",
+  "a",
+  "an",
+].map(word);
+
+const STORAGE_UNIT_RE = word("(\\d+)\\s*(gb|g|tb)");
 
 export function normalizeSearchWord(query: string): string {
   const text = query.trim();
@@ -84,7 +97,7 @@ export function normalizeSearchWord(query: string): string {
 
   let normalized = text.toLowerCase();
   normalized = normalized.replace(/[?!.:,/()[\]{}]+/g, " ");
-  normalized = normalized.replace(/\b(\d+)\s*(gb|g|tb)\b/g, "$1");
+  normalized = normalized.replace(STORAGE_UNIT_RE, "$1");
 
   for (const [pattern, replacement] of PHRASE_REPLACEMENTS) {
     normalized = normalized.replace(pattern, replacement);
@@ -471,7 +484,7 @@ function buildMetadata(data: JsonObject): SearchMetadataData | null {
 // Unrecognized codes keep their number so they stay debuggable.
 type SaleStatus = "on_sale" | "reserved" | "sold" | `unknown_${number}`;
 
-function saleStatusFromState(state: number | null): SaleStatus | null {
+export function saleStatusFromState(state: number | null): SaleStatus | null {
   if (state === null) return null;
   if (state === 0) return "on_sale";
   if (state === 1) return "reserved";
@@ -501,8 +514,9 @@ function buildListing(item: JsonObject): ListingData {
     thumbnail_url: thumbnailUrl,
     description: null,
     image_urls: thumbnailUrl ? [thumbnailUrl] : [],
-    sorted_at: strOrNull(item["sortDate"]),
-    location_name: strOrNull(item["mainLocationName"]),
+    // Empty strings are nulls here, as they were in the Python (`or None`).
+    sorted_at: strOrNull(item["sortDate"] || null),
+    location_name: strOrNull(item["mainLocationName"] || null),
     parcel_fee_krw: intOrNull(item["parcelFee"]),
     chat_count: intOrNull(item["chatCount"]),
     wish_count: intOrNull(item["wishCount"]),
@@ -626,10 +640,6 @@ export function parseSearchPricePage(
       selected_model_name: null,
       selected_option_name: null,
     };
-  }
-
-  if (!hasDatasets && summaryIsEmpty(summary) && !emptyResult) {
-    throw new JoongnaParseError("Joongna page did not expose summary or hydrated pricing datasets");
   }
 
   return {
