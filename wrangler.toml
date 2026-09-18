@@ -34,12 +34,9 @@ JOONGNA_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKi
 # public internet and what lets it trust the x-lost-plus-* headers it is
 # given.
 #
-# The gateway holds these zone routes and forwards them here:
-#
-#   joongna.lost.plus/mcp
-#   joongna.lost.plus/mcp/*
-#   joongna.lost.plus/healthz                              (answered by the gateway)
-#   joongna.lost.plus/.well-known/oauth-protected-resource* (answered by the gateway)
+# The gateway holds every zone route for joongna.lost.plus (the patterns are
+# in auth/gateway/wrangler.toml) and forwards /mcp and /mcp/* here; it answers
+# /healthz and /.well-known/oauth-protected-resource* itself.
 #
 # Adding a `routes` entry here and deploying would steal those routes from the
 # gateway and put this Worker, which refuses every request without gateway

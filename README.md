@@ -14,13 +14,15 @@ the `JOONGNA` service binding declared by the `auth-gateway` Worker
 (`gateway/config/cloudflare.gateway.json`) maps `joongna.lost.plus` to this
 binding under the `mcp` policy with token scope `joongna`.
 
-The gateway holds these zone routes:
+The gateway holds every zone route for `joongna.lost.plus` (the exact
+patterns are in `gateway/wrangler.toml` in the auth repo). Of what arrives:
 
-| route | handled by |
+| path | handled by |
 | --- | --- |
-| `joongna.lost.plus/mcp`, `/mcp/*` | forwarded here over the binding |
-| `joongna.lost.plus/healthz` | the gateway (`ok`, `text/plain`) |
-| `joongna.lost.plus/.well-known/oauth-protected-resource*` | the gateway |
+| `/mcp`, `/mcp/*` | forwarded here over the binding |
+| `/healthz` | the gateway (`ok`, `text/plain`) |
+| `/.well-known/oauth-protected-resource*` | the gateway |
+| anything else | the gateway, 404 |
 
 Authentication belongs to the gateway. It validates the Common Auth token,
 strips it, and forwards the caller as percent-encoded `x-lost-plus-{sub,
