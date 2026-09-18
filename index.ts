@@ -154,7 +154,7 @@ const NOISE_PATTERNS: RegExp[] = [
   /\ban\b/g,
 ];
 
-function normalizeSearchWord(query: string): string {
+export function normalizeSearchWord(query: string): string {
   const text = query.trim();
   if (!text) throw new Error("query must not be blank");
 
@@ -663,7 +663,7 @@ function parseHydratedDatasets(html: string): {
   return { datasets, metadata, hasEmptyResultMarker };
 }
 
-function parseSearchPricePage(
+export function parseSearchPricePage(
   html: string,
   opts: { query: string; searchWord: string; sourceUrl: string; fetchedAt: string },
 ): SearchPriceResult {
@@ -711,7 +711,7 @@ function parseSearchPricePage(
   };
 }
 
-function parseSearchKeywordPage(
+export function parseSearchKeywordPage(
   html: string,
   opts: { query: string; searchWord: string; sourceUrl: string; fetchedAt: string },
 ): SearchKeywordResult {
@@ -731,7 +731,7 @@ function parseSearchKeywordPage(
   };
 }
 
-function parseProductDetail(payload: JsonObject): { description: string | null; image_urls: string[] } {
+export function parseProductDetail(payload: JsonObject): { description: string | null; image_urls: string[] } {
   const data = payload["data"];
   if (!isObject(data)) {
     throw new JoongnaParseError("Joongna product response did not contain product data");
