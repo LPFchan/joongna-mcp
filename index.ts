@@ -288,11 +288,10 @@ interface PriceHistoryDatasetData {
 
 /**
  * Listings whose product-detail request failed and so carry only search-page
- * fields (description null, thumbnail only). Non-zero usually means the
- * Workers per-invocation subrequest cap was hit: on the free plan that is 50,
- * shared between the search page and the per-listing detail fetches, so at
- * most 49 listings per call can be enriched (measured live 2026-09-19). The
- * Python server had no such limit.
+ * fields (description null, thumbnail only). Detail fetches are one
+ * subrequest per unique listing, all in flight at once, so a Joongna
+ * hiccup or a platform subrequest cap shows up here rather than as a failed
+ * search.
  */
 type DetailFailures = { detail_failures: number };
 
@@ -849,7 +848,7 @@ function buildServer(env: Env): McpServer {
   );
   const config = clientConfigFromEnv(env);
 
-  server.registerTool("joongna_search_price", { description: "Return Joongna price data and listings with descriptions and product images. Descriptions and images cost one upstream request per listing; on the current Workers plan at most 49 listings per call can be enriched, and detail_failures in the result counts the ones that were not.", inputSchema: z.object({
+  server.registerTool("joongna_search_price", { description: "Return Joongna price data and listings with descriptions and product images. Descriptions and images cost one upstream request per listing and can partially fail; detail_failures in the result counts the listings that came back without them.", inputSchema: z.object({
               query: z.string().describe("Natural-language question or device name to search on Joongna"),
               search_word: z
                 .string()
@@ -871,7 +870,7 @@ function buildServer(env: Env): McpServer {
               return text(result);
             });
 
-  server.registerTool("joongna_search_keyword", { description: "Return Joongna listings, including sold-out items, descriptions, and product images. Descriptions and images cost one upstream request per listing; on the current Workers plan at most 49 listings per call can be enriched, and detail_failures in the result counts the ones that were not.", inputSchema: z.object({
+  server.registerTool("joongna_search_keyword", { description: "Return Joongna listings, including sold-out items, descriptions, and product images. Descriptions and images cost one upstream request per listing and can partially fail; detail_failures in the result counts the listings that came back without them.", inputSchema: z.object({
               query: z.string().describe("Product name to search for on Joongna"),
               search_word: z
                 .string()

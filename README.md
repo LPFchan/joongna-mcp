@@ -54,14 +54,11 @@ request fails the listing keeps its search thumbnail and a `null`
 description; the search itself still succeeds, and `detail_failures` in the
 result says how many listings that happened to.
 
-The usual reason it happens is the platform: Cloudflare caps a Worker
-invocation at 50 subrequests on the free plan, shared between the search
-page and the detail fetches, so at most 49 listings per call can be enriched
-(fewer if the keyword search had to retry an empty page). Measured
-2026-09-19: `joongna_search_keyword` with `max_listings=60` returns 50
-listings (all Joongna's page carries), the first 49 with details,
-`detail_failures: 1`; `max_listings=40` reports 0. Ask for at most 49 if
-every listing needs a description. The Python server had no such limit. Joongna errors (non-200,
+Detail fetches are one subrequest per unique listing, so a Joongna hiccup
+or a platform subrequest cap (Cloudflare limits these per invocation by
+plan) shows up as a non-zero `detail_failures` rather than a failed search.
+Note that Joongna's keyword page carries at most 50 listings, so
+`max_listings` above 50 returns 50. Joongna errors (non-200,
 non-HTML, suspected anti-bot page) come back as MCP tool errors
 (`isError: true`) with the reason as text.
 
