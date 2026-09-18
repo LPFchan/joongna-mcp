@@ -822,7 +822,19 @@ function text(value: unknown): { content: Array<{ type: "text"; text: string }> 
 }
 
 function buildServer(env: Env): McpServer {
-  const server = new McpServer({ name: "joongna-mcp", version: "0.1.0" });
+  const server = new McpServer(
+    { name: "joongna-mcp", version: "0.1.0" },
+    {
+      // The tool list and the discover document are static, so a 2026-07-28
+      // client may hold them for five minutes instead of re-fetching on every
+      // session. `private` because every request here arrives with a caller
+      // identity attached; nothing is meant for a shared cache.
+      cacheHints: {
+        "tools/list": { ttlMs: 300_000, cacheScope: "private" },
+        "server/discover": { ttlMs: 300_000, cacheScope: "private" },
+      },
+    },
+  );
   const config = clientConfigFromEnv(env);
 
   server.registerTool("joongna_search_price", { description: "Return Joongna price data and listings with descriptions and product images.", inputSchema: z.object({
