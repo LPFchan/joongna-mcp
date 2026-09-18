@@ -42,6 +42,27 @@ only read by the Python fallback.
   — full search listings, including sold-out items.
   `max_listings`: 1–100, default 20.
 
+## Listing sale status
+
+Every listing carries `sale_status`, derived from the bare integer Joongna
+puts in its search payload:
+
+| raw code | `sale_status` | product page shows |
+| --- | --- | --- |
+| 0 | `on_sale` | no badge |
+| 1 | `reserved` | 예약중 |
+| 3 | `sold` | 판매완료 |
+| anything else | `unknown_<code>` | — |
+
+Sold listings do come back from `joongna_search_keyword`. Joongna's
+`excludeSoldOutProductYn` URL parameter does not filter them out — the real
+site applies that filter client-side, after the server-rendered payload these
+parsers read. Filter on `sale_status` instead.
+
+Note that Joongna's product detail API uses a different scale for the same
+idea (search `state: 3` is `productStatus: 9` there), so the two are not
+interchangeable.
+
 ## Deploy (Worker)
 
 ```sh

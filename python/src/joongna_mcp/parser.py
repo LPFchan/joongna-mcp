@@ -186,6 +186,18 @@ def _flatten_scatter_points(raw_scatter_prices: list[dict]) -> list[HourlyScatte
     return points
 
 
+def _sale_status(state: object) -> str | None:
+    """Map Joongna's bare sale-state integer to a readable label.
+
+    Verified against product pages: 0 shows no badge, 1 shows 예약중, 3 shows
+    판매완료. Unrecognized codes keep their number so they stay debuggable.
+    """
+    if state is None:
+        return None
+    code = int(state)
+    return {0: "on_sale", 1: "reserved", 3: "sold"}.get(code, f"unknown_{code}")
+
+
 def _build_listing(item: dict) -> Listing:
     sequence = int(item["seq"])
     article_url = item.get("articleUrl")
@@ -213,7 +225,7 @@ def _build_listing(item: dict) -> Listing:
         wish_count=int(item["wishCount"]) if item.get("wishCount") is not None else None,
         pickup_badge=bool(item["pickupBadgeFlag"]) if item.get("pickupBadgeFlag") is not None else None,
         certified_seller=bool(item["certifySellerFlag"]) if item.get("certifySellerFlag") is not None else None,
-        state=int(item["state"]) if item.get("state") is not None else None,
+        sale_status=_sale_status(item.get("state")),
     )
 
 

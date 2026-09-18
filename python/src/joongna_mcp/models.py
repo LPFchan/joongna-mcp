@@ -51,7 +51,10 @@ class Listing(BaseModel):
     wish_count: int | None = None
     pickup_badge: bool | None = None
     certified_seller: bool | None = None
-    state: int | None = None
+    sale_status: str | None = Field(
+        default=None,
+        description="on_sale, reserved, sold, or unknown_<code> for unrecognized codes",
+    )
 
 
 class ListingDetails(BaseModel):

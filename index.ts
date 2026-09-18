@@ -338,7 +338,7 @@ interface ListingData {
   wish_count: number | null;
   pickup_badge: boolean | null;
   certified_seller: boolean | null;
-  state: number | null;
+  sale_status: SaleStatus | null;
 }
 
 interface PriceHistoryDatasetData {
@@ -542,6 +542,19 @@ function buildMetadata(data: JsonObject): SearchMetadataData | null {
   };
 }
 
+// Joongna's listing payloads carry sale state as a bare integer. Verified
+// against product pages: 0 shows no badge, 1 shows 예약중, 3 shows 판매완료.
+// Unrecognized codes keep their number so they stay debuggable.
+type SaleStatus = "on_sale" | "reserved" | "sold" | `unknown_${number}`;
+
+function saleStatusFromState(state: number | null): SaleStatus | null {
+  if (state === null) return null;
+  if (state === 0) return "on_sale";
+  if (state === 1) return "reserved";
+  if (state === 3) return "sold";
+  return `unknown_${state}`;
+}
+
 function buildListing(item: JsonObject): ListingData {
   const sequence = Number.parseInt(String(item["seq"]), 10);
   const articleUrl = item["articleUrl"];
@@ -571,7 +584,7 @@ function buildListing(item: JsonObject): ListingData {
     wish_count: intOrNull(item["wishCount"]),
     pickup_badge: boolOrNull(item["pickupBadgeFlag"]),
     certified_seller: boolOrNull(item["certifySellerFlag"]),
-    state: intOrNull(item["state"]),
+    sale_status: saleStatusFromState(intOrNull(item["state"])),
   };
 }
 

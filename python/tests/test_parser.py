@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 
-from joongna_mcp.parser import parse_product_detail, parse_search_price_page
+import pytest
+
+from joongna_mcp.parser import _sale_status, parse_product_detail, parse_search_price_page
 
 
 def test_parse_search_price_page_extracts_summary_history_and_listings() -> None:
@@ -167,6 +169,19 @@ def test_parse_product_detail_extracts_description_and_ordered_images() -> None:
         "https://img2.joongna.com/second.jpg",
     ]
 
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        (0, "on_sale"),
+        (1, "reserved"),
+        (3, "sold"),
+        (2, "unknown_2"),
+        (None, None),
+    ],
+)
+def test_sale_status_maps_joongna_state_codes(state: int | None, expected: str | None) -> None:
+    assert _sale_status(state) == expected
 
 def _next_chunk(payload_obj: dict) -> str:
     encoded = json.dumps(f"22:{json.dumps(payload_obj, ensure_ascii=False, separators=(',', ':'))}")
