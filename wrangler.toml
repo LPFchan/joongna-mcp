@@ -3,17 +3,60 @@ main = "index.ts"
 compatibility_date = "2025-09-01"
 compatibility_flags = ["nodejs_compat"]
 
+# Not on a workers.dev subdomain. This is load-bearing rather than tidy:
+# wrangler defaults `workers_dev` to `routes.length === 0`, so removing the
+# routes below would otherwise publish this Worker at
+# joongna-mcp.<subdomain>.workers.dev -- a public entrance to a Worker whose
+# whole security model is that it has none. It would fail closed (no identity
+# headers, so 500 on everything), but "reachable only through the gateway's
+# service binding" would stop being true.
+workers_dev = false
+
 [vars]
-AUTH_URL = "https://auth.lost.plus"
-TOKEN_SCOPE = "joongna"
 JOONGNA_BASE_URL = "https://web.joongna.com"
 JOONGNA_TIMEOUT_SECONDS = "20"
 JOONGNA_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15"
 
-# Route joongna.lost.plus MCP traffic to this Worker.
-routes = [
-  { pattern = "joongna.lost.plus/mcp", zone_name = "lost.plus" },
-  { pattern = "joongna.lost.plus/mcp/*", zone_name = "lost.plus" },
-  { pattern = "joongna.lost.plus/healthz", zone_name = "lost.plus" },
-  { pattern = "joongna.lost.plus/.well-known/oauth-protected-resource*", zone_name = "lost.plus" },
-]
+# AUTH_URL and TOKEN_SCOPE are gone with the code that read them. This Worker
+# no longer talks to auth.lost.plus; the gateway does, and the scope now lives
+# in the gateway's route table (auth/gateway/config/cloudflare.gateway.json).
+#
+# Removing them was not optional. A Worker's subrequest to a hostname in its
+# own zone skips that zone's Worker routes and goes to the origin, so the
+# whoami call this Worker used to make reached the Cloudflare tunnel in front
+# of a stopped container rather than the hub -- which is why every
+# authenticated request to joongna.lost.plus returned 401 until this cutover. The
+# gateway reaches the hub over an AUTH_HUB service binding instead.
+
+# ---------------------------------------------------------------------------
+# NO ROUTES. THIS IS DELIBERATE -- DO NOT RESTORE THEM WITHOUT READING THIS.
+# ---------------------------------------------------------------------------
+#
+# This Worker is a route-less backend. It is reached only through the
+# JOONGNA service binding declared by the `auth-gateway` Worker, which is
+# what makes it unreachable from the public internet and what lets it trust the
+# x-lost-plus-* headers it is given.
+#
+# The four patterns it used to hold, which the gateway Worker takes over:
+#
+#   joongna.lost.plus/mcp
+#   joongna.lost.plus/mcp/*
+#   joongna.lost.plus/healthz
+#   joongna.lost.plus/.well-known/oauth-protected-resource*
+#
+# Deleting them from this file does NOT detach them. wrangler only publishes a
+# route list when the list is non-empty, so an absent list means it skips the
+# call and Cloudflare keeps pointing all four at this Worker. Deploying this
+# code therefore leaves those four paths attached to a service that now refuses
+# every request that does not carry gateway identity headers -- which is every
+# request arriving straight off a route. joongna.lost.plus goes to 500 until the
+# routes are moved.
+#
+# It fails closed rather than open, which is the intended direction, but it is
+# still an outage, and the routes have to be moved with the Cloudflare API
+# rather than with wrangler. The order and the API call are written out in
+# auth/gateway/wrangler.toml. Read that before deploying either side.
+#
+# To roll the whole thing back: PUT the four routes back to
+# `"script":"joongna-mcp"`, `git revert` the commit that stripped auth from
+# index.ts, and deploy this Worker.
