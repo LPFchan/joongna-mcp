@@ -100,8 +100,12 @@ npm run typecheck
 ## Deploy
 
 ```sh
-CLOUDFLARE_API_TOKEN=… npm run deploy     # wrangler deploy
+npm run deploy      # passage run --env CLOUDFLARE_API_TOKEN=infra/CF_MASTER_TOKEN -- wrangler deploy
 ```
+
+The deploy token comes from passage at deploy time (`infra` /
+`CF_MASTER_TOKEN`, through the `passage` setup module); an already-exported
+`CLOUDFLARE_API_TOKEN` wins if one is set.
 
 Configuration is the `[vars]` block in `wrangler.toml` (`JOONGNA_BASE_URL`,
 `JOONGNA_TIMEOUT_SECONDS`, `JOONGNA_USER_AGENT`). There are no secrets and
