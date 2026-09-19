@@ -27,7 +27,7 @@ patterns are in `gateway/wrangler.toml` in the auth repo). Of what arrives:
 Authentication belongs to the gateway. It validates the Common Auth token,
 strips it, and forwards the caller as percent-encoded `x-lost-plus-{sub,
 email, name, role, encoding}` headers. This Worker reads those with the
-shared [`@lost-plus/gateway-identity`](https://github.com/LPFchan/gateway-identity)
+shared [`@lpfchan/gateway-identity`](https://github.com/LPFchan/gateway-identity)
 package and never sees a credential; a request without them is refused with a 500
 because it can only mean the deployment is wrong (see `refused()` in
 `index.ts`). There is no `AUTH_URL`, no token scope, and no secret here.

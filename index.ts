@@ -7,13 +7,13 @@ import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 // A route-less backend behind the gateway Worker. It authenticates nobody:
 // the gateway has already asked auth.lost.plus who the caller is, and hands
 // the answer over in x-lost-plus-* headers, read by the shared
-// @lost-plus/gateway-identity parser. See the routes comment in wrangler.toml
+// @lpfchan/gateway-identity parser. See the routes comment in wrangler.toml
 // for why this Worker holds no route of its own.
 //
 // No caches. The Python server kept search pages and product details in
 // memory for five minutes; module-level state does not persist across Worker
 // requests, so every tool call fetches fresh data.
-import { identityFrom } from "@lost-plus/gateway-identity";
+import { identityFrom } from "@lpfchan/gateway-identity";
 import { z } from "zod";
 
 export interface Env {
