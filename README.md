@@ -26,8 +26,9 @@ patterns are in `gateway/wrangler.toml` in the auth repo). Of what arrives:
 
 Authentication belongs to the gateway. It validates the Common Auth token,
 strips it, and forwards the caller as percent-encoded `x-lost-plus-{sub,
-email, name, role, encoding}` headers. This Worker reads those (`identity.ts`)
-and never sees a credential; a request without them is refused with a 500
+email, name, role, encoding}` headers. This Worker reads those with the
+shared [`@lost-plus/gateway-identity`](https://github.com/LPFchan/gateway-identity)
+package and never sees a credential; a request without them is refused with a 500
 because it can only mean the deployment is wrong (see `refused()` in
 `index.ts`). There is no `AUTH_URL`, no token scope, and no secret here.
 
@@ -35,18 +36,17 @@ It holds no state: no D1, KV, or R2. Every tool call fetches Joongna fresh.
 
 ## Tools
 
-- `joongna_search_price(query, search_word?, max_listings?, force_refresh?)`
+- `joongna_search_price(query, search_word?, max_listings?)`
   — price summary, BID/EXECUTION price history, and available listings.
   `max_listings`: 1–20, default 10.
-- `joongna_search_keyword(query, search_word?, max_listings?, force_refresh?)`
+- `joongna_search_keyword(query, search_word?, max_listings?)`
   — full search listings, including sold-out items.
   `max_listings`: 1–100, default 20.
 
 `query` is normalized into a Joongna search word (English device names are
 translated, English filler is stripped, spaces are removed); pass
-`search_word` to use an exact term instead. `force_refresh` is accepted for
-compatibility with earlier clients and does nothing: there is no cache, and
-`from_cache` is always `false`.
+`search_word` to use an exact term instead. There is no cache; every call
+fetches Joongna fresh.
 
 Each listing is enriched with the seller's description and full-size image
 URLs from Joongna's product API, one request per unique listing. If that
@@ -93,7 +93,7 @@ interchangeable.
 
 ```sh
 npm install
-npm test            # vitest: parser/normalizer fixtures, identity parsing, refusal path, MCP handshakes, tool calls against a fake Joongna
+npm test            # vitest: parser/normalizer fixtures, refusal path, MCP handshakes, tool calls against a fake Joongna
 npm run typecheck
 ```
 
@@ -144,4 +144,5 @@ Until 2026-09-18 this ran as a Python container (`python/`, FastMCP, port 8000
 on OCI behind the local auth gateway and the Cloudflare tunnel). The Worker
 port replaced it; the Python tree was deleted once its tests were carried
 over to `test/`. The Python server kept five-minute in-memory caches, which
-the Worker does not.
+the Worker does not; its `force_refresh` parameter and `from_cache` field
+went with them.

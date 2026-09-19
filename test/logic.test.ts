@@ -99,7 +99,7 @@ describe("parseSearchKeywordPage", () => {
       sourceUrl: "u",
       fetchedAt: "t",
     });
-    expect(result).toMatchObject({ total_count: 0, listings: [], from_cache: false });
+    expect(result).toMatchObject({ total_count: 0, listings: [] });
   });
 });
 

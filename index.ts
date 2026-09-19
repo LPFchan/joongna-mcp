@@ -6,16 +6,15 @@ import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 //
 // A route-less backend behind the gateway Worker. It authenticates nobody:
 // the gateway has already asked auth.lost.plus who the caller is, and hands
-// the answer over in x-lost-plus-* headers. See identity.ts, and the routes
-// comment in wrangler.toml for why this Worker holds no route of its own.
+// the answer over in x-lost-plus-* headers, read by the shared
+// @lost-plus/gateway-identity parser. See the routes comment in wrangler.toml
+// for why this Worker holds no route of its own.
 //
 // No caches. The Python server kept search pages and product details in
 // memory for five minutes; module-level state does not persist across Worker
-// requests, so every tool call fetches fresh data, `from_cache` is always
-// false, and `force_refresh` is accepted for API compatibility but does
-// nothing.
+// requests, so every tool call fetches fresh data.
+import { identityFrom } from "@lost-plus/gateway-identity";
 import { z } from "zod";
-import { identityFrom } from "./identity";
 
 export interface Env {
   JOONGNA_BASE_URL: string;
@@ -300,7 +299,6 @@ interface SearchPriceResult extends DetailFailures {
   search_word: string;
   source_url: string;
   fetched_at: string;
-  from_cache: boolean;
   empty_result: boolean;
   empty_result_reason: string | null;
   summary: PriceSummaryData;
@@ -315,7 +313,6 @@ interface SearchKeywordResult extends DetailFailures {
   search_word: string;
   source_url: string;
   fetched_at: string;
-  from_cache: boolean;
   total_count: number;
   listings: ListingData[];
 }
@@ -655,7 +652,6 @@ export function parseSearchPricePage(
     search_word: opts.searchWord,
     source_url: opts.sourceUrl,
     fetched_at: opts.fetchedAt,
-    from_cache: false,
     detail_failures: 0,
     empty_result: emptyResult,
     empty_result_reason: emptyResult ? "No pricing data found for this search word" : null,
@@ -681,7 +677,6 @@ export function parseSearchKeywordPage(
     search_word: opts.searchWord,
     source_url: opts.sourceUrl,
     fetched_at: opts.fetchedAt,
-    from_cache: false,
     detail_failures: 0,
     total_count: listings.length,
     listings,
@@ -861,10 +856,6 @@ function buildServer(env: Env): McpServer {
                 .max(20)
                 .default(10)
                 .describe("Maximum listings to return per dataset"),
-              force_refresh: z
-                .boolean()
-                .default(false)
-                .describe("Bypass the in-memory cache for this request"),
             }) }, async ({ query, search_word, max_listings }) => {
               const result = await searchPrice(config, { query, searchWord: search_word, maxListings: max_listings });
               return text(result);
@@ -883,10 +874,6 @@ function buildServer(env: Env): McpServer {
                 .max(100)
                 .default(20)
                 .describe("Maximum listings to return"),
-              force_refresh: z
-                .boolean()
-                .default(false)
-                .describe("Bypass the in-memory cache for this request"),
             }) }, async ({ query, search_word, max_listings }) => {
               const result = await searchKeyword(config, { query, searchWord: search_word, maxListings: max_listings });
               return text(result);
@@ -923,25 +910,15 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     // Before routing, not after. There is no path here that serves without an
     // identity, so there is no reason for one to be reachable before the check.
-    const identity = identityFrom(request.headers);
-    if (identity === null) return refused();
+    if (identityFrom(request.headers) === null) return refused();
 
     const url = new URL(request.url);
 
-    // /healthz and /.well-known/oauth-protected-resource are gone from here.
-    // The gateway answers both now, which is why healthz changed shape: `ok`
-    // as text/plain rather than `{"ok":true}` as JSON. Anything checking the
-    // body rather than the status needs updating.
-    if (url.pathname === "/" || url.pathname === "") {
-      return Response.json({
-        name: "joongna-mcp",
-        runtime: "cloudflare-workers",
-        mcp_path: "/mcp",
-        caller: { sub: identity.sub, email: identity.email, name: identity.name, role: identity.role },
-        tools: ["joongna_search_price", "joongna_search_keyword"],
-      });
-    }
-
+    // Only /mcp. /healthz and /.well-known/oauth-protected-resource are the
+    // gateway's now (which is why healthz changed shape: `ok` as text/plain
+    // rather than `{"ok":true}` as JSON), and `/` never arrives here because
+    // the gateway does not route it.
+    //
     // `/mcp/*` as well as `/mcp`, which this service accepted before the
     // cutover and keeps accepting. The gateway's route for this host has no
     // path_prefix, so both arrive here.

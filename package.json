@@ -10,6 +10,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@lost-plus/gateway-identity": "github:LPFchan/gateway-identity#v1.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
     "zod": "^4.2.0"
   },
