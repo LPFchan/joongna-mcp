@@ -1,21 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import Ajv2020 from "ajv/dist/2020.js";
 import worker, { type Env } from "../index";
-
-// The Worker's entry point, called directly. Plain vitest rather than
-// @cloudflare/vitest-pool-workers: nothing under test needs a workerd runtime
-// or a binding, and the one thing that reaches the network -- fetching
-// Joongna -- is replaced with a fake below.
-//
-// Three groups: the refusal path (a request without gateway identity gets
-// nothing), the MCP handshakes for the 2025-era and 2026-07-28 clients, and
-// the tool calls themselves, which port the Python test_service.py.
+type JsonRecord = Record<string, unknown>;
 
 const env: Env = {
   JOONGNA_BASE_URL: "https://web.joongna.com",
   JOONGNA_TIMEOUT_SECONDS: "20",
   JOONGNA_USER_AGENT: "test-agent",
 };
-
 const IDENTITY = {
   "x-lost-plus-sub": "42",
   "x-lost-plus-email": "me%40lost.plus",
@@ -23,352 +15,652 @@ const IDENTITY = {
   "x-lost-plus-role": "user",
   "x-lost-plus-encoding": "percent-utf8",
 };
-
-function request(path: string, headers: Record<string, string> = {}): Request {
-  return new Request(`https://joongna.lost.plus${path}`, { headers });
+type JsonRpc = { jsonrpc: "2.0"; id: number; method: string; params?: unknown };
+function rpcRequest(body: JsonRpc, headers: Record<string, string> = {}) {
+  return new Request("https://joongna.lost.plus/mcp", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      ...IDENTITY,
+      ...headers,
+    },
+    body: JSON.stringify(body),
+  });
 }
-
-// The 2026-07-28 revision carries the handshake in every request.
+async function rpc(body: JsonRpc, headers: Record<string, string> = {}) {
+  const response = await worker.fetch(rpcRequest(body, headers), env);
+  const text = await response.text();
+  const data = text.startsWith("event:")
+    ? text
+        .split("\n")
+        .find((line) => line.startsWith("data: "))!
+        .slice(6)
+    : text;
+  return { status: response.status, json: JSON.parse(data) as any };
+}
 const META_2026 = {
   "io.modelcontextprotocol/protocolVersion": "2026-07-28",
   "io.modelcontextprotocol/clientInfo": { name: "test", version: "0" },
   "io.modelcontextprotocol/clientCapabilities": {},
 };
-
-type JsonRpc = { jsonrpc: "2.0"; id: number; method: string; params?: unknown };
-
-async function rpc(body: JsonRpc, headers: Record<string, string> = {}): Promise<{ status: number; json: any }> {
-  const response = await worker.fetch(
-    new Request("https://joongna.lost.plus/mcp", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        accept: "application/json, text/event-stream",
-        ...IDENTITY,
-        ...headers,
-      },
-      body: JSON.stringify(body),
-    }),
-    env,
-  );
-  const text = await response.text();
-  // 2025-era responses come back as one SSE event; 2026 ones as plain JSON.
-  const data = text.startsWith("event:") ? text.split("\n").find((l) => l.startsWith("data: "))!.slice(6) : text;
-  return { status: response.status, json: JSON.parse(data) };
-}
-
-function initialize(protocolVersion: string): JsonRpc {
-  return {
-    jsonrpc: "2.0",
-    id: 1,
-    method: "initialize",
-    params: { protocolVersion, capabilities: {}, clientInfo: { name: "test", version: "0" } },
-  };
-}
-
 function rpc2026(method: string, params: Record<string, unknown> = {}) {
   return rpc(
     { jsonrpc: "2.0", id: 1, method, params: { ...params, _meta: META_2026 } },
-    { "mcp-protocol-version": "2026-07-28", "mcp-method": method },
+    {
+      "mcp-protocol-version": "2026-07-28",
+      "mcp-method": method,
+      ...(typeof params.name === "string" ? { "mcp-name": params.name } : {}),
+    },
   );
 }
-
 function callTool(name: string, args: Record<string, unknown>) {
   return rpc(
-    { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } },
+    {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name, arguments: args },
+    },
     { "mcp-protocol-version": "2025-06-18" },
   );
 }
+function responseFor(items: unknown[], totalSize = items.length) {
+  return Response.json({
+    data: { meta: { code: 0, message: "SUCCESS" }, items, totalSize },
+  });
+}
+function listing(seq: number, state: number, price: unknown = 150000) {
+  return {
+    seq,
+    state,
+    price,
+    title: `상품 ${seq}`,
+    url: `https://img.example/${seq}.jpg`,
+    storeSeq: "seller-1",
+    objectType: "product",
+  };
+}
 
-describe("without gateway identity headers", () => {
-  for (const path of ["/", "/mcp", "/healthz", "/anything"]) {
-    it(`refuses ${path}`, async () => {
-      const response = await worker.fetch(request(path), env);
-      expect(response.status).toBe(500);
-      expect(await response.json()).toMatchObject({ error: "no gateway identity" });
+afterEach(() => vi.unstubAllGlobals());
+
+describe("gateway boundary", () => {
+  it("refuses requests without complete gateway identity", async () => {
+    const response = await worker.fetch(
+      new Request("https://joongna.lost.plus/mcp", { method: "POST" }),
+      env,
+    );
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({
+      error: "no gateway identity",
     });
-  }
+  });
 
-  it("refuses a POST to /mcp, which is how a real client calls it", async () => {
+  it("keeps non-MCP paths unavailable after identity", async () => {
+    const response = await worker.fetch(
+      new Request("https://joongna.lost.plus/healthz", { headers: IDENTITY }),
+      env,
+    );
+    expect(response.status).toBe(404);
+  });
+
+  it("refuses bearer-only callers", async () => {
     const response = await worker.fetch(
       new Request("https://joongna.lost.plus/mcp", {
         method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+        headers: { authorization: "Bearer token" },
       }),
       env,
     );
     expect(response.status).toBe(500);
-  });
-
-  it("refuses a caller presenting a bearer token, which it must not validate", async () => {
-    const response = await worker.fetch(request("/mcp", { authorization: "Bearer lp_something" }), env);
-    expect(response.status).toBe(500);
-  });
-
-  it("refuses an identity sent without the encoding declaration", async () => {
-    const { "x-lost-plus-encoding": _, ...unencoded } = IDENTITY;
-    const response = await worker.fetch(request("/mcp", unencoded), env);
-    expect(response.status).toBe(500);
-  });
-
-  it("refuses a partial identity", async () => {
-    const { "x-lost-plus-role": _, ...partial } = IDENTITY;
-    const response = await worker.fetch(request("/mcp", partial), env);
-    expect(response.status).toBe(500);
-  });
-});
-
-describe("with gateway identity headers", () => {
-  it("404s a path it does not serve", async () => {
-    // Including `/`, /healthz and the metadata document: the gateway routes
-    // only /mcp here, so nothing else is served.
-    for (const path of ["/", "/healthz", "/.well-known/oauth-protected-resource/mcp", "/nope"]) {
-      const response = await worker.fetch(request(path, IDENTITY), env);
-      expect(response.status).toBe(404);
-    }
-  });
-});
-
-describe("MCP handshake", () => {
-  for (const version of ["2025-06-18", "2025-03-26"]) {
-    it(`initializes a ${version} client`, async () => {
-      const { status, json } = await rpc(initialize(version));
-      expect(status).toBe(200);
-      expect(json.result.protocolVersion).toBe(version);
-      expect(json.result.serverInfo).toEqual({ name: "joongna-mcp", version: "0.1.0" });
-      expect(json.result.capabilities.tools).toBeDefined();
+    expect(await response.json()).toMatchObject({
+      error: "no gateway identity",
     });
-  }
+  });
 
-  it("accepts POST /mcp/ with a trailing slash, as the gateway's /mcp/* route allows", async () => {
-    const response = await worker.fetch(
-      new Request("https://joongna.lost.plus/mcp/", {
+  it("refuses partial and malformed gateway identity", async () => {
+    const { "x-lost-plus-role": _role, ...partial } = IDENTITY;
+    const missingRole = await worker.fetch(
+      new Request("https://joongna.lost.plus/mcp", {
         method: "POST",
-        headers: { "content-type": "application/json", accept: "application/json, text/event-stream", ...IDENTITY },
-        body: JSON.stringify(initialize("2025-06-18")),
+        headers: partial,
       }),
       env,
     );
-    expect(response.status).toBe(200);
-  });
+    expect(missingRole.status).toBe(500);
 
-  it("lists both tools for a 2025 client", async () => {
-    const { json } = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }, { "mcp-protocol-version": "2025-06-18" });
-    expect(json.result.tools.map((t: { name: string }) => t.name)).toEqual([
-      "joongna_search_price",
-      "joongna_search_keyword",
-    ]);
-    const price = json.result.tools[0].inputSchema.properties;
-    expect(price.max_listings).toMatchObject({ minimum: 1, maximum: 20, default: 10 });
-    expect(price.force_refresh).toBeUndefined(); // the cache it bypassed went with the Python
-    const keyword = json.result.tools[1].inputSchema.properties;
-    expect(keyword.max_listings).toMatchObject({ minimum: 1, maximum: 100, default: 20 });
-
-    const priceOutput = json.result.tools[0].outputSchema.properties;
-    expect(priceOutput.available_listings.items.properties.sale_status).toBeDefined();
-    expect(priceOutput.available_listings.items.properties.state).toBeUndefined();
-    const keywordOutput = json.result.tools[1].outputSchema.properties;
-    expect(keywordOutput.listings.items.properties.sale_status).toBeDefined();
-    expect(keywordOutput.listings.items.properties.state).toBeUndefined();
-  });
-
-  it("answers server/discover for a 2026-07-28 client with a five-minute cache hint", async () => {
-    const { status, json } = await rpc2026("server/discover");
-    expect(status).toBe(200);
-    expect(json.result.supportedVersions).toContain("2026-07-28");
-    expect(json.result).toMatchObject({ ttlMs: 300_000, cacheScope: "private" });
-  });
-
-  it("tells a 2026-07-28 client to cache tools/list for five minutes, privately", async () => {
-    const { status, json } = await rpc2026("tools/list");
-    expect(status).toBe(200);
-    expect(json.result.tools).toHaveLength(2);
-    expect(json.result).toMatchObject({ ttlMs: 300_000, cacheScope: "private" });
+    const malformed = await worker.fetch(
+      new Request("https://joongna.lost.plus/mcp", {
+        method: "POST",
+        headers: { ...IDENTITY, "x-lost-plus-encoding": "latin1" },
+      }),
+      env,
+    );
+    expect(malformed.status).toBe(500);
   });
 });
 
-// --- tool calls, ported from the Python test_service.py ---------------------
+describe("MCP contract", () => {
+  it.each(["2025-06-18", "2025-03-26"])(
+    "initializes legacy protocol %s",
+    async (protocolVersion) => {
+      const { status, json } = await rpc({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion,
+          capabilities: {},
+          clientInfo: { name: "test", version: "0" },
+        },
+      });
+      expect(status).toBe(200);
+      expect(json.result.protocolVersion).toBe(protocolVersion);
+      expect(json.result.serverInfo).toEqual({
+        name: "joongna-mcp",
+        version: "0.2.0",
+      });
+    },
+  );
 
-const LISTING = {
-  seq: 230894836,
-  price: 260000,
-  url: "https://img2.joongna.com/search-thumbnail.jpg",
-  title: "아이폰13미니 128GB",
-  state: 0,
-};
+  it("serves modern discovery and private cache hints", async () => {
+    const discover = await rpc2026("server/discover");
+    expect(discover.json.result).toMatchObject({
+      ttlMs: 300_000,
+      cacheScope: "private",
+    });
+    const listed = await rpc2026("tools/list");
+    expect(listed.json.result).toMatchObject({
+      ttlMs: 300_000,
+      cacheScope: "private",
+    });
+    expect(listed.json.result.tools).toHaveLength(3);
+  });
 
-const PRODUCT_DETAIL = {
-  data: {
-    productSeq: 230894836,
-    productDescription: "판매자가 작성한 상품 설명",
-    media: [
-      { mediaType: 0, originUrl: "https://img2.joongna.com/full-1.jpg" },
-      { mediaType: 0, originUrl: "https://img2.joongna.com/full-2.jpg" },
-    ],
-  },
-};
+  it("executes a modern structured tool call", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => responseFor([])),
+    );
+    const result = await rpc2026("tools/call", {
+      name: "joongna_search_keyword",
+      arguments: { search_word: "아이폰", include_details: false },
+    });
+    expect(result.status).toBe(200);
+    expect(result.json.result.structuredContent).toMatchObject({
+      outcome: "ok",
+      returned_count: 0,
+      pagination: { has_more: false },
+    });
+  });
 
-function nextChunk(payloadObj: unknown): string {
-  const encoded = JSON.stringify("22:" + JSON.stringify(payloadObj));
-  return "<script>self.__next_f.push([1," + encoded + "])</" + "script>";
-}
+  it("advertises the migrated tools and object-root output variants", async () => {
+    const { json } = await rpc(
+      { jsonrpc: "2.0", id: 1, method: "tools/list" },
+      { "mcp-protocol-version": "2025-06-18" },
+    );
+    expect(
+      json.result.tools.map((tool: { name: string }) => tool.name),
+    ).toEqual([
+      "joongna_search_keyword",
+      "joongna_search_price",
+      "joongna_get_seller_evidence",
+    ]);
+    const search = json.result.tools[0];
+    expect(search.inputSchema.properties.max_listings).toBeUndefined();
+    expect(search.inputSchema.properties.offset).toBeUndefined();
+    expect(search.outputSchema.type).toBe("object");
+    expect(
+      search.outputSchema.oneOf.map(
+        (variant: { properties: { outcome: { const: string } } }) =>
+          variant.properties.outcome.const,
+      ),
+    ).toEqual(["ok", "partial", "error"]);
+    expect(json.result.tools[1].inputSchema.properties.date_range.default).toBe(
+      30,
+    );
+  });
 
-function html(body: string): Response {
-  return new Response(body, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
-}
-
-/** A fake Joongna: one search-price page, one keyword page, one product. */
-function fakeJoongna() {
-  const calls: { url: string; headers: Headers }[] = [];
-  const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-    const url = String(input);
-    calls.push({ url, headers: new Headers(init?.headers) });
-    if (url.startsWith("https://web.joongna.com/search-price/")) {
-      const query = {
-        queryKey: ["postProductPriceScatterPlot", "BID"],
-        state: {
-          data: {
-            data: {
-              searchKeyword: "아이폰13미니",
-              productPrice: { linePrices: [], scatterPrices: [] },
-              items: [LISTING],
+  it("passes native price/status/sort filters, excludes external ads, and preserves invalid prices as null", async () => {
+    const calls: Request[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init);
+        calls.push(request);
+        return responseFor(
+          [
+            { ...listing(1, 0, "1,2,3") },
+            { ...listing(2, 3, 160000) },
+            {
+              seq: 3,
+              state: 0,
+              price: 170000,
+              title: "외부 광고",
+              objectType: "external_shopping_ad",
             },
+            { ...listing(4, 9, 180000) },
+          ],
+          99,
+        );
+      }),
+    );
+    const { json } = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "joongna_search_keyword",
+          arguments: {
+            search_word: "아이폰 17",
+            min_price_krw: 150000,
+            max_price_krw: 200000,
+            statuses: ["sold"],
+            sort: "price_low",
+            include_details: false,
           },
         },
-      };
-      return html(nextChunk({ state: { queries: [query] } }));
-    }
-    if (url.startsWith("https://web.joongna.com/search/")) {
-      return html(nextChunk({ items: [LISTING] }));
-    }
-    if (url.startsWith("https://product-api.joongna.com/basic/")) {
-      return Response.json(PRODUCT_DETAIL);
-    }
-    throw new Error("unexpected fetch " + url);
-  });
-  vi.stubGlobal("fetch", fetchMock);
-  return { calls, detailCalls: () => calls.filter((c) => c.url.includes("product-api")).map((c) => c.url) };
-}
-
-afterEach(() => {
-  vi.unstubAllGlobals();
-});
-
-describe("tool calls", () => {
-  it("both search tools include description and images by default", async () => {
-    const joongna = fakeJoongna();
-    const expectedImages = ["https://img2.joongna.com/full-1.jpg", "https://img2.joongna.com/full-2.jpg"];
-
-    const keyword = await callTool("joongna_search_keyword", { query: "아이폰13미니" });
-    expect(keyword.json.result.isError).toBeUndefined();
-    const keywordResult = JSON.parse(keyword.json.result.content[0].text);
-    expect(keywordResult.search_word).toBe("아이폰13미니");
-    expect(keywordResult.listings[0].description).toBe("판매자가 작성한 상품 설명");
-    expect(keywordResult.listings[0].image_urls).toEqual(expectedImages);
-    expect(keywordResult.listings[0].sale_status).toBe("on_sale");
-    expect(keyword.json.result.structuredContent).toEqual(keywordResult);
-
-    const price = await callTool("joongna_search_price", { query: "아이폰13미니" });
-    const priceResult = JSON.parse(price.json.result.content[0].text);
-    expect(priceResult.available_listings[0].description).toBe("판매자가 작성한 상품 설명");
-    expect(priceResult.available_listings[0].image_urls).toEqual(expectedImages);
-    expect(priceResult.registered_price_history.listings[0].description).toBe("판매자가 작성한 상품 설명");
-    expect(price.json.result.structuredContent).toEqual(priceResult);
-
-    // One detail fetch per unique listing per call, even though the price
-    // result carries the same listing in two places.
-    expect(joongna.detailCalls()).toEqual([
-      "https://product-api.joongna.com/basic/230894836?increaseViewCount=false",
-      "https://product-api.joongna.com/basic/230894836?increaseViewCount=false",
-    ]);
-  });
-
-  it("sends the browser-shaped headers Joongna expects, with the configured user agent", async () => {
-    const joongna = fakeJoongna();
-    await callTool("joongna_search_keyword", { query: "아이폰13미니" });
-    const page = joongna.calls[0];
-    expect(page.url).toBe(
-      "https://web.joongna.com/search/%EC%95%84%EC%9D%B4%ED%8F%B013%EB%AF%B8%EB%8B%88?excludeSoldOutProductYn=false",
+      },
+      { "mcp-protocol-version": "2025-06-18" },
     );
-    expect(page.headers.get("user-agent")).toBe("test-agent");
-    expect(page.headers.get("accept-language")).toContain("ko-KR");
-    expect(page.headers.get("referer")).toBe("https://web.joongna.com/search-price");
-    const detail = joongna.calls[1];
-    expect(detail.headers.get("accept")).toBe("application/json");
-  });
-
-  it("uses an explicit search_word instead of normalizing the query", async () => {
-    const joongna = fakeJoongna();
-    await callTool("joongna_search_price", { query: "whatever", search_word: "갤럭시S24" });
-    expect(joongna.calls[0].url).toBe("https://web.joongna.com/search-price/%EA%B0%A4%EB%9F%AD%EC%8B%9CS24");
-  });
-
-  it("rejects max_listings outside the schema before fetching anything", async () => {
-    const joongna = fakeJoongna();
-    const { json } = await callTool("joongna_search_price", { query: "아이폰", max_listings: 21 });
-    expect(json.result?.isError ?? json.error !== undefined).toBe(true);
-    expect(joongna.calls).toHaveLength(0);
-  });
-
-  it("reports an anti-bot page as a tool error rather than a crash", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => html("<html>please solve this captcha</html>")));
-    const { status, json } = await callTool("joongna_search_price", { query: "아이폰" });
-    expect(status).toBe(200);
-    expect(json.result.isError).toBe(true);
-    expect(json.result.content[0].text).toBe("Joongna returned a suspected anti-bot page");
-  });
-
-  it("reports a non-200 from Joongna as a tool error", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 503 })));
-    const { json } = await callTool("joongna_search_price", { query: "아이폰" });
-    expect(json.result.isError).toBe(true);
-    expect(json.result.content[0].text).toMatch(/^Joongna returned HTTP 503 for /);
-  });
-
-  it("degrades to no description when the product API fails, instead of failing the search", async () => {
-    const joongna = fakeJoongna();
-    const real = globalThis.fetch;
-    vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
-      if (String(input).includes("product-api")) return new Response("err", { status: 500 });
-      return real(input, init);
+    const body = JSON.parse(await calls[0].clone().text());
+    expect(body.searchWord).toBe("아이폰 17");
+    expect(body.priceFilter).toEqual({ minPrice: 150000, maxPrice: 200000 });
+    expect(body.saleYn).toBe("SALE_Y");
+    expect(body.sort).toBe("PRICE_ASC_SORT");
+    expect(json.result.structuredContent.outcome).toBe("ok");
+    expect(json.result.structuredContent.scanned_count).toBe(4);
+    expect(json.result.structuredContent.excluded_counts).toEqual({
+      status: 1,
+      external_ad: 1,
+      unknown_status: 1,
     });
-    const { json } = await callTool("joongna_search_keyword", { query: "아이폰13미니" });
-    expect(json.result.isError).toBeUndefined();
-    const result = JSON.parse(json.result.content[0].text);
-    expect(result.listings[0].description).toBeNull();
-    expect(result.listings[0].image_urls).toEqual(["https://img2.joongna.com/search-thumbnail.jpg"]);
-    expect(result.detail_failures).toBe(1);
-    expect(joongna.calls).toHaveLength(1); // the page; the detail call never reached the fake
+    expect(json.result.structuredContent.listings).toHaveLength(1);
+    expect(json.result.structuredContent.listings[0].price_krw).toBe(160000);
+    expect(json.result.structuredContent.listings[0].sold_at).toBeNull();
   });
 
-  it("counts how many unique listings could not be detail-enriched", async () => {
-    // What the Workers subrequest cap looks like from inside: the first
-    // detail fetches succeed and the rest throw. The search must still
-    // succeed, and the count must say how much of the tail is thumbnail-only.
-    const items = Array.from({ length: 5 }, (_, i) => ({ ...LISTING, seq: 1000 + i }));
+  it("retains listings when details fail and still fetches deduplicated seller evidence", async () => {
     let detailCalls = 0;
-    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
-      const url = String(input);
-      if (url.includes("product-api")) {
-        detailCalls++;
-        if (detailCalls > 3) throw new TypeError("Too many subrequests.");
-        return Response.json(PRODUCT_DETAIL);
-      }
-      return html(nextChunk({ items }));
-    }));
-
-    const { json } = await callTool("joongna_search_keyword", { query: "아이폰13미니" });
-    expect(json.result.isError).toBeUndefined();
-    const result = JSON.parse(json.result.content[0].text);
-    expect(result.total_count).toBe(5);
-    expect(result.detail_failures).toBe(2);
-    expect(result.listings.filter((l: { description: string | null }) => l.description === null)).toHaveLength(2);
+    let sellerCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/v3/search/all"))
+          return responseFor([
+            { ...listing(1, 0), storeSeq: "zero" },
+            { ...listing(2, 0), storeSeq: "zero" },
+            { ...listing(3, 0), storeSeq: [] },
+          ]);
+        if (url.includes("/basic/")) {
+          detailCalls++;
+          return new Response("detail unavailable", { status: 503 });
+        }
+        if (url.includes("/v2/my-store/zero")) {
+          sellerCalls++;
+          return Response.json({
+            data: {
+              meta: { code: 0 },
+              safeTradeCount: 0,
+              reviewCount: 2,
+            },
+          });
+        }
+        throw new Error(`unexpected URL ${url}`);
+      }),
+    );
+    const { json } = await callTool("joongna_search_keyword", {
+      search_word: "아이폰",
+      include_seller_evidence: true,
+    });
+    const data = json.result.structuredContent;
+    expect(data.outcome).toBe("partial");
+    expect(detailCalls).toBe(3);
+    expect(sellerCalls).toBe(1);
+    expect(data.listings).toHaveLength(3);
+    expect(data.listings[0]).toMatchObject({
+      detail_status: "failed",
+      seller_evidence_status: "available",
+      seller_evidence: {
+        status: "available",
+        source_metrics: { safeTradeCount: 0, reviewCount: 2 },
+        safe_trade_count: { value: 0, status: "available" },
+      },
+    });
+    expect(data.listings[2]).toMatchObject({
+      seller_id: null,
+      seller_evidence_status: "unavailable",
+      seller_error: { code: "missing_seller_id", retryable: false },
+    });
+    const listed = await rpc(
+      { jsonrpc: "2.0", id: 20, method: "tools/list" },
+      { "mcp-protocol-version": "2025-06-18" },
+    );
+    const schema = listed.json.result.tools.find(
+      (tool: { name: string }) => tool.name === "joongna_search_keyword",
+    ).outputSchema;
+    expect(new Ajv2020({ strict: false }).compile(schema)(data)).toBe(true);
   });
 
-  it("reports zero detail failures when every detail fetch succeeds", async () => {
-    fakeJoongna();
-    const { json } = await callTool("joongna_search_price", { query: "아이폰13미니" });
-    expect(JSON.parse(json.result.content[0].text).detail_failures).toBe(0);
+  it("deduplicates seller batch requests, preserves one result per input, and caps concurrency", async () => {
+    let active = 0;
+    let peak = 0;
+    const sellerCalls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (!url.includes("/v2/my-store/"))
+          throw new Error(`unexpected URL ${url}`);
+        const id = decodeURIComponent(url.split("/").at(-1)!);
+        sellerCalls.push(id);
+        active++;
+        peak = Math.max(peak, active);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        active--;
+        if (id === "missing")
+          return Response.json({
+            data: { meta: { code: 0 }, reviewCount: 1 },
+          });
+        if (id === "failed") return new Response("busy", { status: 503 });
+        return Response.json({
+          data: { meta: { code: 0 }, safeTradeCount: 0, reviewCount: 1 },
+        });
+      }),
+    );
+    const sellerIds = [
+      "zero",
+      "zero",
+      "missing",
+      "failed",
+      ...Array.from({ length: 10 }, (_, index) => `seller-${index}`),
+    ];
+    const { json } = await callTool("joongna_get_seller_evidence", {
+      seller_ids: sellerIds,
+    });
+    const data = json.result.structuredContent;
+    expect(data.outcome).toBe("partial");
+    expect(data.sellers).toHaveLength(sellerIds.length);
+    expect(sellerCalls).toHaveLength(new Set(sellerIds).size);
+    expect(peak).toBeLessThanOrEqual(8);
+    expect(data.sellers[0]).toMatchObject({
+      seller_id: "zero",
+      status: "available",
+      safe_trade_count: { value: 0, status: "available" },
+    });
+    expect(data.sellers[1]).toMatchObject({ seller_id: "zero" });
+    expect(data.sellers[2]).toMatchObject({
+      seller_id: "missing",
+      status: "unavailable",
+      safe_trade_count: { value: null, status: "unavailable" },
+    });
+    expect(data.sellers[3]).toMatchObject({
+      seller_id: "failed",
+      status: "failed",
+      error: { code: "upstream_http", retryable: true },
+    });
+    const listed = await rpc(
+      { jsonrpc: "2.0", id: 21, method: "tools/list" },
+      { "mcp-protocol-version": "2025-06-18" },
+    );
+    const schema = listed.json.result.tools.find(
+      (tool: { name: string }) => tool.name === "joongna_get_seller_evidence",
+    ).outputSchema;
+    expect(new Ajv2020({ strict: false }).compile(schema)(data)).toBe(true);
+  });
+
+  it("uses UTF-8 opaque cursors and keeps native empty-page termination", async () => {
+    const bodies: JsonRecord[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init);
+        bodies.push(JSON.parse(await request.clone().text()));
+        return bodies.length === 1
+          ? responseFor([listing(1, 0)])
+          : responseFor([]);
+      }),
+    );
+    const first = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: {
+          name: "joongna_search_keyword",
+          arguments: { search_word: "아이폰 17", include_details: false },
+        },
+      },
+      { "mcp-protocol-version": "2025-06-18" },
+    );
+    const cursor = first.json.result.structuredContent.pagination.next_cursor;
+    expect(cursor).toEqual(expect.any(String));
+    const second = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 4,
+        method: "tools/call",
+        params: {
+          name: "joongna_search_keyword",
+          arguments: {
+            search_word: "아이폰 17",
+            cursor,
+            include_details: false,
+          },
+        },
+      },
+      { "mcp-protocol-version": "2025-06-18" },
+    );
+    expect(bodies[1].page).toBe(1);
+    expect(second.json.result.structuredContent.pagination).toMatchObject({
+      has_more: false,
+      next_cursor: null,
+      raw_count: 0,
+    });
+  });
+
+  it("returns structured parse and retry errors with unchanged request cursor", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => responseFor([null])),
+    );
+    const malformed = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 5,
+        method: "tools/call",
+        params: {
+          name: "joongna_search_keyword",
+          arguments: {
+            search_word: "아이폰",
+            cursor: null,
+            include_details: false,
+          },
+        },
+      },
+      { "mcp-protocol-version": "2025-06-18" },
+    );
+    expect(malformed.json.result.isError).toBe(true);
+    expect(malformed.json.result.structuredContent).toMatchObject({
+      outcome: "error",
+      error: { code: "parse_failed", retryable: false },
+      request_cursor: null,
+      pagination: { has_more: null, next_cursor: null },
+    });
+    const ajv = new Ajv2020({ strict: false });
+    const listed = await rpc(
+      { jsonrpc: "2.0", id: 8, method: "tools/list" },
+      { "mcp-protocol-version": "2025-06-18" },
+    );
+    const schema = listed.json.result.tools.find(
+      (tool: { name: string }) => tool.name === "joongna_search_keyword",
+    ).outputSchema;
+    expect(ajv.compile(schema)(malformed.json.result.structuredContent)).toBe(
+      true,
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => responseFor([listing(99, 0)])),
+    );
+    const successful = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 9,
+        method: "tools/call",
+        params: {
+          name: "joongna_search_keyword",
+          arguments: { search_word: "아이폰", include_details: false },
+        },
+      },
+      { "mcp-protocol-version": "2025-06-18" },
+    );
+    const cursor =
+      successful.json.result.structuredContent.pagination.next_cursor;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response("busy", {
+            status: 429,
+            headers: { "retry-after": "12" },
+          }),
+      ),
+    );
+    const rateLimited = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 6,
+        method: "tools/call",
+        params: {
+          name: "joongna_search_keyword",
+          arguments: { search_word: "아이폰", cursor, include_details: false },
+        },
+      },
+      { "mcp-protocol-version": "2025-06-18" },
+    );
+    expect(rateLimited.json.result.structuredContent).toMatchObject({
+      outcome: "error",
+      error: { code: "rate_limited", retryable: true, retry_after_seconds: 12 },
+      request_cursor: cursor,
+    });
+    expect(ajv.compile(schema)(rateLimited.json.result.structuredContent)).toBe(
+      true,
+    );
+  });
+
+  it("distinguishes forbidden upstream blocks and keeps body aborts retryable", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("forbidden", { status: 403 })),
+    );
+    const forbidden = await callTool("joongna_search_keyword", {
+      search_word: "아이폰",
+      include_details: false,
+    });
+    expect(forbidden.json.result).toMatchObject({
+      isError: true,
+      structuredContent: {
+        outcome: "error",
+        error: { code: "upstream_blocked", retryable: true },
+      },
+    });
+
+    const abortedResponse = new Response("body");
+    Object.defineProperty(abortedResponse, "json", {
+      value: async () => {
+        const error = new Error("body read aborted");
+        error.name = "AbortError";
+        throw error;
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => abortedResponse),
+    );
+    const aborted = await callTool("joongna_search_keyword", {
+      search_word: "아이폰",
+      include_details: false,
+    });
+    expect(aborted.json.result).toMatchObject({
+      isError: true,
+      structuredContent: {
+        outcome: "error",
+        error: { code: "timeout", retryable: true },
+      },
+    });
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response("busy", {
+            status: 429,
+            headers: { "retry-after": "0" },
+          }),
+      ),
+    );
+    const zeroRetryAfter = await callTool("joongna_search_keyword", {
+      search_word: "아이폰",
+      include_details: false,
+    });
+    expect(zeroRetryAfter.json.result.structuredContent.error).toMatchObject({
+      code: "rate_limited",
+      retryable: true,
+      retry_after_seconds: 0,
+    });
+  });
+
+  it("requests numeric 90-day registered chart data without inventing averages", async () => {
+    let requestBody: JsonRecord | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init);
+        requestBody = JSON.parse(await request.clone().text());
+        return Response.json({
+          data: {
+            productPrice: {
+              linePrices: [{ date: "2026-06-22", avgPrice: 1200000 }],
+              scatterPrices: [],
+              scatterPriceCountAvg: 1,
+            },
+            items: [],
+          },
+        });
+      }),
+    );
+    const { json } = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 7,
+        method: "tools/call",
+        params: {
+          name: "joongna_search_price",
+          arguments: {
+            search_word: "아이폰 17",
+            date_range: 90,
+            source_label: "registered_price",
+            include_details: false,
+          },
+        },
+      },
+      { "mcp-protocol-version": "2025-06-18" },
+    );
+    expect(requestBody).toMatchObject({
+      searchWord: "아이폰 17",
+      dateRange: 90,
+      priceType: 0,
+    });
+    expect(json.result.structuredContent.chart.requested_range.date_range).toBe(
+      90,
+    );
+    expect(
+      json.result.structuredContent.chart.native_scatter_price_count_avg,
+    ).toBe(1);
+    expect(
+      json.result.structuredContent.chart.source_reported_scatter_average_krw,
+    ).toBeUndefined();
   });
 });

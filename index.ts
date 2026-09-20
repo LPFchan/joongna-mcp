@@ -1,47 +1,31 @@
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
-
-// joongna-mcp Worker: MCP server that scrapes Joongna's search and
-// search-price pages. Ported from the Python container that ran on OCI until
-// 2026-09; the parser and normalizer keep its behavior.
-//
-// A route-less backend behind the gateway Worker. It authenticates nobody:
-// the gateway has already asked auth.lost.plus who the caller is, and hands
-// the answer over in x-lost-plus-* headers, read by the shared
-// @lpfchan/gateway-identity parser. See the routes comment in wrangler.toml
-// for why this Worker holds no route of its own.
-//
-// No caches. The Python server kept search pages and product details in
-// memory for five minutes; module-level state does not persist across Worker
-// requests, so every tool call fetches fresh data.
 import { identityFrom } from "@lpfchan/gateway-identity";
 import { z } from "zod";
 
 export interface Env {
-  JOONGNA_BASE_URL: string;
-  JOONGNA_TIMEOUT_SECONDS: string;
-  JOONGNA_USER_AGENT: string;
+  JOONGNA_BASE_URL?: string;
+  JOONGNA_SEARCH_API_BASE_URL?: string;
+  JOONGNA_TIMEOUT_SECONDS?: string;
+  JOONGNA_USER_AGENT?: string;
 }
 
+type Status = "on_sale" | "reserved" | "sold" | "removed" | "unknown";
+type RequestedStatus = "on_sale" | "reserved" | "sold";
+type Sort = "recent" | "price_low" | "price_high";
+type JsonRecord = Record<string, unknown>;
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15";
+const SEARCH_PAGE_SIZE = 50;
+const DETAIL_CONCURRENCY = 8;
+const SEARCH_API = "https://search-api.joongna.com";
+const MAIN_API = "https://main-api.joongna.com";
+const PRODUCT_API = "https://product-api.joongna.com";
 
-const PRODUCT_API_BASE_URL = "https://product-api.joongna.com";
-const KEYWORD_MAX_RETRIES = 3;
-const KEYWORD_RETRY_DELAY_MS = 2000;
-
-// --- normalize ---------------------------------------------------------------
-
-// A whole-word match with the boundary the Python original had. Python's `\b`
-// counts any Unicode letter as a word character, so `pro` in "맥북pro" is not
-// a word of its own there; JavaScript's `\b` is ASCII-only and would split it.
-// The lookarounds reproduce the Python boundary so "맥북pro" and "아이폰a"
-// normalize the same way they did.
 const WORD_START = "(?<![\\p{L}\\p{N}_])";
 const WORD_END = "(?![\\p{L}\\p{N}_])";
 function word(pattern: string): RegExp {
   return new RegExp(WORD_START + pattern + WORD_END, "gu");
 }
-
 const PHRASE_REPLACEMENTS: Array<[RegExp, string]> = [
   [word("apple watch"), "애플워치"],
   [word("airpods max"), "에어팟맥스"],
@@ -60,8 +44,7 @@ const PHRASE_REPLACEMENTS: Array<[RegExp, string]> = [
   [word("pro"), "프로"],
   [word("max"), "맥스"],
 ];
-
-const NOISE_PATTERNS: RegExp[] = [
+const NOISE_PATTERNS = [
   "how much does",
   "how much do",
   "how much is",
@@ -88,876 +71,1367 @@ const NOISE_PATTERNS: RegExp[] = [
   "a",
   "an",
 ].map(word);
-
 const STORAGE_UNIT_RE = word("(\\d+)\\s*(gb|g|tb)");
-
 export function normalizeSearchWord(query: string): string {
   const text = query.trim();
   if (!text) throw new Error("query must not be blank");
-
-  let normalized = text.toLowerCase();
-  normalized = normalized.replace(/[?!.:,/()[\]{}]+/g, " ");
-  normalized = normalized.replace(STORAGE_UNIT_RE, "$1");
-
-  for (const [pattern, replacement] of PHRASE_REPLACEMENTS) {
+  let normalized = text
+    .toLowerCase()
+    .replace(/[?!.:,/()[\]{}]+/g, " ")
+    .replace(STORAGE_UNIT_RE, "$1");
+  for (const [pattern, replacement] of PHRASE_REPLACEMENTS)
     normalized = normalized.replace(pattern, replacement);
-  }
-  for (const pattern of NOISE_PATTERNS) {
+  for (const pattern of NOISE_PATTERNS)
     normalized = normalized.replace(pattern, " ");
-  }
-
-  normalized = normalized.replace(/[^0-9a-zA-Z가-힣]+/g, " ");
-  normalized = normalized.replace(/\s+/g, "");
-
+  normalized = normalized.replace(/[^0-9a-zA-Z가-힣]+/g, "");
   if (normalized) return normalized;
-
   const fallback = text.replace(/[^0-9a-zA-Z가-힣]+/g, "");
   if (!fallback) throw new Error("query did not contain a usable search term");
   return fallback;
 }
-
-// --- client ------------------------------------------------------------------
-
-class JoongnaFetchError extends Error {}
-
-interface ClientConfig {
-  baseUrl: string;
-  timeoutSeconds: number;
-  userAgent: string;
+function record(value: unknown): JsonRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as JsonRecord)
+    : {};
 }
-
-function clientConfigFromEnv(env: Env): ClientConfig {
-  return {
-    baseUrl: (env.JOONGNA_BASE_URL || "https://web.joongna.com").replace(/\/+$/, ""),
-    timeoutSeconds: Number.parseFloat(env.JOONGNA_TIMEOUT_SECONDS || "20"),
-    userAgent: env.JOONGNA_USER_AGENT || DEFAULT_USER_AGENT,
-  };
+function stringOrNull(value: unknown): string | null {
+  return value === null || value === undefined || value === ""
+    ? null
+    : String(value);
 }
-
-function pageHeaders(config: ClientConfig): Record<string, string> {
-  return {
-    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    "cache-control": "no-cache",
-    pragma: "no-cache",
-    referer: config.baseUrl + "/search-price",
-    "user-agent": config.userAgent,
-  };
-}
-
-function buildSearchUrl(config: ClientConfig, searchWord: string): string {
-  return config.baseUrl + "/search-price/" + encodeURIComponent(searchWord.trim());
-}
-
-function buildSearchKeywordUrl(config: ClientConfig, keyword: string): string {
-  return config.baseUrl + "/search/" + encodeURIComponent(keyword.trim()) + "?excludeSoldOutProductYn=false";
-}
-
-function checkAntiBot(body: string, url: string): void {
-  const lowered = body.toLowerCase();
-  if (lowered.includes("captcha") || (lowered.includes("cloudflare") && !body.includes("__next_f.push"))) {
-    throw new JoongnaFetchError("Joongna returned a suspected anti-bot page");
+function sourceId(value: unknown): string | null {
+  if (typeof value === "number")
+    return Number.isSafeInteger(value) && value >= 0 ? String(value) : null;
+  if (typeof value === "string") {
+    const text = value.trim();
+    return text ? text : null;
   }
+  return null;
+}
+function firstSourceId(...values: unknown[]): string | null {
+  for (const value of values) {
+    const id = sourceId(value);
+    if (id !== null) return id;
+  }
+  return null;
+}
+function intOrNull(value: unknown): number | null {
+  if (typeof value === "number")
+    return Number.isFinite(value) && Number.isInteger(value) ? value : null;
+  if (typeof value !== "string" || !value.trim()) return null;
+  const text = value.trim();
+  if (!/^-?\d+$/.test(text) && !/^-?\d{1,3}(,\d{3})+$/.test(text)) return null;
+  const n = Number(text.replace(/,/g, ""));
+  return Number.isFinite(n) && Number.isInteger(n) ? n : null;
+}
+function priceOrNull(value: unknown): number | null {
+  const n = intOrNull(value);
+  return n !== null && n >= 0 ? n : null;
+}
+function isoNow(): string {
+  return new Date().toISOString();
+}
+export function saleStatusFromState(state: unknown): Status {
+  const n = intOrNull(state);
+  if (n === 0) return "on_sale";
+  if (n === 1) return "reserved";
+  if (n === 3) return "sold";
+  return "unknown";
 }
 
-async function fetchHtmlPage(config: ClientConfig, url: string, kind: string): Promise<[string, string]> {
-  if (!url) throw new JoongnaFetchError(kind + " must not be blank");
-
-  const resp = await fetch(url, {
-    headers: pageHeaders(config),
-    signal: AbortSignal.timeout(Math.round(config.timeoutSeconds * 1000)),
-  });
-
-  if (resp.status !== 200) {
-    throw new JoongnaFetchError("Joongna returned HTTP " + resp.status + " for " + url);
-  }
-
-  const contentType = resp.headers.get("content-type") ?? "";
-  if (!contentType.includes("text/html")) {
-    throw new JoongnaFetchError(
-      "Joongna returned unexpected content type " + JSON.stringify(contentType) + " for " + url,
-    );
-  }
-
-  const body = await resp.text();
-  checkAntiBot(body, url);
-  return [url, body];
-}
-
-async function fetchSearchPage(config: ClientConfig, searchWord: string): Promise<[string, string]> {
-  if (!searchWord.trim()) throw new JoongnaFetchError("search_word must not be blank");
-  return fetchHtmlPage(config, buildSearchUrl(config, searchWord), "search_word");
-}
-
-async function fetchSearchKeywordPage(config: ClientConfig, keyword: string): Promise<[string, string]> {
-  if (!keyword.trim()) throw new JoongnaFetchError("keyword must not be blank");
-  return fetchHtmlPage(config, buildSearchKeywordUrl(config, keyword), "keyword");
-}
-
-async function fetchProductDetail(
-  config: ClientConfig,
-  sequence: number,
-): Promise<JsonObject> {
-  const url =
-    PRODUCT_API_BASE_URL + "/basic/" + sequence + "?increaseViewCount=false";
-  let resp: Response;
-  try {
-    resp = await fetch(url, {
-      headers: { ...pageHeaders(config), accept: "application/json" },
-      signal: AbortSignal.timeout(Math.round(config.timeoutSeconds * 1000)),
-    });
-  } catch {
-    throw new JoongnaFetchError("Could not fetch Joongna product " + sequence);
-  }
-
-  if (resp.status !== 200) {
-    throw new JoongnaFetchError("Joongna returned HTTP " + resp.status + " for " + url);
-  }
-
-  const contentType = resp.headers.get("content-type") ?? "";
-  if (!contentType.includes("application/json")) {
-    throw new JoongnaFetchError(
-      "Joongna returned unexpected content type " + JSON.stringify(contentType) + " for " + url,
-    );
-  }
-
-  let payload: unknown;
-  try {
-    payload = await resp.json();
-  } catch {
-    throw new JoongnaFetchError("Joongna returned invalid JSON for " + url);
-  }
-  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
-    throw new JoongnaFetchError("Joongna returned an invalid product response for " + url);
-  }
-  return payload as JsonObject;
-}
-
-// --- parser ------------------------------------------------------------------
-
-class JoongnaParseError extends Error {}
-
-// Extracts the string literal out of self.__next_f.push([N,"..."]) calls.
-const NEXT_FLIGHT_RE = /self\.__next_f\.push\(\[\d+,\s*"((?:\\.|[^"\\])*)"\]\)/gs;
-
-const SUMMARY_RE = />(평균 가격|가장 높은 가격|가장 낮은 가격)<\/span><span[^>]*>([^<]+)<\/span>/g;
-
-type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
-type JsonObject = { [key: string]: JsonValue };
-
-const nullableInteger = z.number().int().nullable();
-
-const PriceSummarySchema = z.object({
-  average_price_krw: nullableInteger,
-  highest_price_krw: nullableInteger,
-  lowest_price_krw: nullableInteger,
+const EvidenceErrorSchema = z.object({
+  code: z.string(),
+  retryable: z.boolean().optional(),
 });
-
-const SearchMetadataSchema = z.object({
-  search_keyword: z.string().nullable(),
-  selected_exposure_keyword: z.string().nullable(),
-  selected_model_name: z.string().nullable(),
-  selected_option_name: z.string().nullable(),
+const SellerEvidenceSchema = z.object({
+  marketplace: z.literal("joongna"),
+  seller_id: z.string(),
+  checked_at: z.string(),
+  status: z.enum(["available", "unavailable", "failed"]),
+  source_metrics: z.object({
+    safeTradeCount: z.number().int().nullable(),
+    reviewCount: z.number().int().nullable(),
+  }),
+  safe_trade_count: z.object({
+    value: z.number().int().nullable(),
+    status: z.enum(["available", "unavailable", "failed"]),
+    source_field: z.literal("safeTradeCount"),
+    role_scope: z.literal("unknown"),
+    reason: z.string().optional(),
+  }),
+  source_payload: z.record(z.string(), z.unknown()),
+  error: EvidenceErrorSchema.nullable(),
 });
-
-const SaleStatusSchema = z.union([
-  z.enum(["on_sale", "reserved", "sold"]),
-  z.string().regex(/^unknown_-?\d+$/),
-]);
-
 const ListingSchema = z.object({
-  sequence: z.number().int(),
-  title: z.string(),
-  price_krw: z.number().int(),
+  marketplace: z.literal("joongna"),
+  listing_id: z.string(),
   listing_url: z.string(),
-  thumbnail_url: z.string().nullable(),
+  title: z.string(),
   description: z.string().nullable(),
+  price_krw: z.number().int().nullable(),
+  status: z.enum(["on_sale", "reserved", "sold", "removed", "unknown"]),
+  raw_status: z.string().nullable(),
+  seller_id: z.string().nullable(),
+  category: z.object({
+    id: z.string().nullable(),
+    name: z.string().nullable(),
+  }),
+  observed_at: z.string(),
+  created_at: z.string().nullable(),
+  updated_at: z.string().nullable(),
+  sold_at: z.string().nullable(),
+  detail_status: z.enum([
+    "not_requested",
+    "available",
+    "unavailable",
+    "failed",
+  ]),
+  detail_checked_at: z.string().nullable(),
+  detail_error: EvidenceErrorSchema.nullable(),
+  seller_evidence_status: z.enum([
+    "not_requested",
+    "available",
+    "unavailable",
+    "failed",
+  ]),
+  seller_checked_at: z.string().nullable(),
+  seller_error: EvidenceErrorSchema.nullable(),
+  seller_evidence: SellerEvidenceSchema.nullable(),
+  thumbnail_url: z.string().nullable(),
   image_urls: z.array(z.string()),
-  sorted_at: z.string().nullable(),
-  location_name: z.string().nullable(),
-  parcel_fee_krw: nullableInteger,
-  chat_count: nullableInteger,
-  wish_count: nullableInteger,
-  pickup_badge: z.boolean().nullable(),
-  certified_seller: z.boolean().nullable(),
-  sale_status: SaleStatusSchema.nullable(),
+  promoted_marketplace_product: z.boolean().nullable(),
+  source_flags: z.object({
+    jnPayBadgeFlag: z.boolean().nullable(),
+    pickupBadgeFlag: z.boolean().nullable(),
+    certifiedSellerFlag: z.boolean().nullable(),
+  }),
+  source_dates: z.object({
+    sortDate: z.string().nullable(),
+    updateDate: z.string().nullable(),
+  }),
 });
-
-const PriceHistoryDatasetSchema = z.object({
-  source_key: z.enum(["BID", "EXECUTION"]),
-  label_ko: z.enum(["등록가", "판매가"]),
-  listing_count: z.number().int(),
-  daily_average_prices: z.array(z.object({
-    date: z.string(),
-    average_price_krw: z.number().int(),
-  })),
-  hourly_scatter_points: z.array(z.object({
-    date_hour: z.string(),
-    price_krw: z.number().int(),
-    count: z.number().int(),
-  })),
+const ErrorSchema = z.object({
+  code: z.enum([
+    "authentication_required",
+    "upstream_blocked",
+    "rate_limited",
+    "timeout",
+    "parse_failed",
+    "invalid_query",
+    "unsupported_filter",
+    "cursor_mismatch",
+    "upstream_http",
+  ]),
+  retryable: z.boolean(),
+  retry_after_seconds: z.number().int().nullable().optional(),
+  message: z.string().optional(),
+});
+const PaginationSchema = z.object({
+  native_page_size: z.number().int(),
+  raw_count: z.number().int().nonnegative(),
+  next_cursor: z.string().nullable(),
+  has_more: z.boolean().nullable(),
+  total_count: z.object({
+    value: z.number().int().nullable(),
+    kind: z.enum(["exact", "estimated", "unavailable"]),
+  }),
+});
+const SearchDataSchema = z.object({
+  page_observed_at: z.string(),
+  effective_request: z.record(z.string(), z.unknown()),
+  applied_filters: z.object({
+    price: z.object({
+      upstream: z.enum(["range", "none", "unsupported"]),
+      post_filter: z.boolean(),
+    }),
+    status: z.object({
+      requested: z.array(z.enum(["on_sale", "reserved", "sold"])).nullable(),
+      upstream: z.enum([
+        "include_sold",
+        "include_reserved",
+        "exclude_sold",
+        "none",
+      ]),
+      post_filter: z.array(z.enum(["on_sale", "reserved", "sold"])).nullable(),
+    }),
+  }),
+  scanned_count: z.number().int().nonnegative(),
+  returned_count: z.number().int().nonnegative(),
+  excluded_counts: z.object({
+    status: z.number().int(),
+    external_ad: z.number().int(),
+    unknown_status: z.number().int(),
+  }),
   listings: z.array(ListingSchema),
+  pagination: PaginationSchema,
+  warnings: z.array(z.object({ code: z.string(), message: z.string() })),
 });
-
-const SearchPriceResultSchema = z.object({
-  query: z.string(),
+const ErrorPaginationSchema = z.object({
+  has_more: z.null(),
+  next_cursor: z.null(),
+});
+const SearchOutputSchema = z
+  .discriminatedUnion("outcome", [
+    SearchDataSchema.extend({ outcome: z.literal("ok") }),
+    SearchDataSchema.extend({ outcome: z.literal("partial") }),
+    z.object({
+      outcome: z.literal("error"),
+      effective_request: z.record(z.string(), z.unknown()).optional(),
+      error: ErrorSchema,
+      request_cursor: z.string().nullable(),
+      pagination: ErrorPaginationSchema,
+    }),
+  ])
+  .meta({ type: "object" });
+type Listing = z.infer<typeof ListingSchema>;
+export type SearchListingsResponse = z.infer<typeof SearchOutputSchema>;
+const ChartSchema = z.object({
+  source: z.literal("joongna"),
+  source_label: z.enum(["registered_price", "sales_price"]),
+  requested_range: z.object({
+    date_range: z.union([z.literal(30), z.literal(90), z.literal(180)]),
+  }),
+  observed_range: z.object({
+    date_from: z.string().nullable(),
+    date_to: z.string().nullable(),
+    inclusive_day_count: z.number().int().nullable(),
+  }),
+  completeness: z.enum(["unknown", "partial", "complete"]),
+  weighting_semantics: z.literal("unknown"),
+  population_semantics: z.literal("unknown"),
+  line_prices: z.array(z.record(z.string(), z.unknown())),
+  scatter_prices: z.array(z.record(z.string(), z.unknown())),
+  native_scatter_price_count_avg: z.unknown().nullable(),
+  related_current_listings: z.array(ListingSchema),
+  native_related_listing_count: z.number().int().nonnegative(),
+});
+const ChartDataSchema = z.object({
+  page_observed_at: z.string(),
   search_word: z.string(),
-  source_url: z.string(),
-  fetched_at: z.string(),
-  detail_failures: z.number().int().nonnegative(),
-  empty_result: z.boolean(),
-  empty_result_reason: z.string().nullable(),
-  summary: PriceSummarySchema,
-  metadata: SearchMetadataSchema.nullable(),
-  registered_price_history: PriceHistoryDatasetSchema.nullable(),
-  sold_price_history: PriceHistoryDatasetSchema.nullable(),
-  available_listings: z.array(ListingSchema),
+  chart: ChartSchema,
+  pagination: PaginationSchema,
+  warnings: z.array(z.object({ code: z.string(), message: z.string() })),
 });
+const ChartOutputSchema = z
+  .discriminatedUnion("outcome", [
+    ChartDataSchema.extend({ outcome: z.literal("ok") }),
+    ChartDataSchema.extend({ outcome: z.literal("partial") }),
+    z.object({
+      outcome: z.literal("error"),
+      search_word: z.string().optional(),
+      error: ErrorSchema,
+      request_cursor: z.null(),
+      pagination: ErrorPaginationSchema,
+    }),
+  ])
+  .meta({ type: "object" });
 
-const SearchKeywordResultSchema = z.object({
-  query: z.string(),
-  search_word: z.string(),
-  source_url: z.string(),
-  fetched_at: z.string(),
-  detail_failures: z.number().int().nonnegative(),
-  total_count: z.number().int().nonnegative(),
-  listings: z.array(ListingSchema),
-});
-
-type PriceSummaryData = z.infer<typeof PriceSummarySchema>;
-type SearchMetadataData = z.infer<typeof SearchMetadataSchema>;
-type SaleStatus = z.infer<typeof SaleStatusSchema>;
-type ListingData = z.infer<typeof ListingSchema>;
-type PriceHistoryDatasetData = z.infer<typeof PriceHistoryDatasetSchema>;
-type SearchPriceResult = z.infer<typeof SearchPriceResultSchema>;
-type SearchKeywordResult = z.infer<typeof SearchKeywordResultSchema>;
-
-// Minimal HTML entity unescape for the entities that actually appear in
-// Next.js flight payloads (HTML-escaped titles).
-const HTML_ENTITIES: Record<string, string> = {
-  amp: "&",
-  lt: "<",
-  gt: ">",
-  quot: '"',
-  apos: "'",
-  nbsp: " ",
-};
-
-function unescapeHtml(value: string): string {
-  return value.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (match, entity: string) => {
-    if (entity.startsWith("#x") || entity.startsWith("#X")) {
-      const code = Number.parseInt(entity.slice(2), 16);
-      return Number.isNaN(code) ? match : String.fromCodePoint(code);
-    }
-    if (entity.startsWith("#")) {
-      const code = Number.parseInt(entity.slice(1), 10);
-      return Number.isNaN(code) ? match : String.fromCodePoint(code);
-    }
-    return HTML_ENTITIES[entity] ?? match;
-  });
+export interface SearchInput {
+  query?: string;
+  search_word?: string;
+  min_price_krw?: number;
+  max_price_krw?: number;
+  statuses?: RequestedStatus[];
+  sort?: Sort;
+  cursor?: string | null;
+  include_details?: boolean;
+  include_seller_evidence?: boolean;
 }
-
-function parseKrw(rawValue: string): number | null {
-  const digits = rawValue.replace(/[^0-9]/g, "");
-  if (!digits) return null;
-  return Number.parseInt(digits, 10);
-}
-
-function isObject(value: unknown): value is JsonObject {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-// Decode the string literal captured from a __next_f.push call. The captured
-// text is the raw contents of a JSON double-quoted string, so wrapping it in
-// quotes and running JSON.parse decodes it.
-function decodeFlightLiteral(encoded: string): string | null {
-  try {
-    return JSON.parse('"' + encoded + '"') as string;
-  } catch {
-    return null;
+const SearchInputSchema = z
+  .object({
+    query: z.string().optional(),
+    search_word: z.string().optional(),
+    min_price_krw: z.number().int().nonnegative().optional(),
+    max_price_krw: z.number().int().nonnegative().optional(),
+    statuses: z
+      .array(z.enum(["on_sale", "reserved", "sold"]))
+      .max(3)
+      .optional(),
+    sort: z.enum(["recent", "price_low", "price_high"]).default("recent"),
+    cursor: z.string().nullable().optional(),
+    include_details: z.boolean().default(true),
+    include_seller_evidence: z.boolean().default(false),
+  })
+  .strict();
+const SellerBatchSchema = z
+  .object({ seller_ids: z.array(z.string().trim().min(1)).min(1).max(100) })
+  .strict();
+class DomainError extends Error {
+  constructor(
+    public readonly code: z.infer<typeof ErrorSchema>["code"],
+    public readonly retryable: boolean,
+    public readonly retryAfter?: number,
+    message?: string,
+  ) {
+    super(message ?? code);
   }
 }
-
-function* iterFlightPayloads(html: string): Generator<JsonValue> {
-  NEXT_FLIGHT_RE.lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = NEXT_FLIGHT_RE.exec(html)) !== null) {
-    const decoded = decodeFlightLiteral(match[1]);
-    if (decoded === null || !decoded.includes(":")) continue;
-    const payload = decoded.slice(decoded.indexOf(":") + 1);
+function classifyFetchError(error: unknown): DomainError {
+  if (error instanceof DomainError) return error;
+  if (
+    (error instanceof DOMException &&
+      (error.name === "TimeoutError" || error.name === "AbortError")) ||
+    (error instanceof Error &&
+      (error.name === "TimeoutError" || error.name === "AbortError"))
+  )
+    return new DomainError(
+      "timeout",
+      true,
+      undefined,
+      "Joongna request timed out",
+    );
+  return new DomainError(
+    "upstream_blocked",
+    true,
+    undefined,
+    "Joongna request could not be completed",
+  );
+}
+function configFrom(env: Env) {
+  const seconds = Number.parseFloat(env.JOONGNA_TIMEOUT_SECONDS || "20");
+  return {
+    timeoutMs: Math.round((Number.isFinite(seconds) ? seconds : 20) * 1000),
+    searchApi: (env.JOONGNA_SEARCH_API_BASE_URL || SEARCH_API).replace(
+      /\/+$/,
+      "",
+    ),
+    userAgent: env.JOONGNA_USER_AGENT || DEFAULT_USER_AGENT,
+    listingBase: (env.JOONGNA_BASE_URL || "https://web.joongna.com").replace(
+      /\/+$/,
+      "",
+    ),
+  };
+}
+function validateNativeEnvelope(payload: unknown, context: string): void {
+  const root = record(payload);
+  const data = record(root.data);
+  const meta = record(data.meta ?? root.meta);
+  if (meta.code !== undefined && Number(meta.code) !== 0)
+    throw new DomainError(
+      "upstream_http",
+      true,
+      undefined,
+      `${context} returned native error ${String(meta.message ?? meta.code)}`,
+    );
+}
+async function fetchJson(
+  config: ReturnType<typeof configFrom>,
+  url: string,
+  init: RequestInit = {},
+): Promise<unknown> {
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...init,
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "user-agent": config.userAgent,
+        ...(init.headers || {}),
+      },
+      signal: AbortSignal.timeout(config.timeoutMs),
+    });
+  } catch (error) {
+    throw classifyFetchError(error);
+  }
+  if (response.status === 401 || response.status === 403)
+    throw new DomainError(
+      response.status === 401 ? "authentication_required" : "upstream_blocked",
+      response.status !== 401,
+      undefined,
+      `Joongna returned HTTP ${response.status}`,
+    );
+  if (response.status === 429)
+    throw new DomainError(
+      "rate_limited",
+      true,
+      retryAfterSeconds(response.headers.get("retry-after")),
+      "Joongna rate limited the request",
+    );
+  if (response.status >= 500)
+    throw new DomainError(
+      "upstream_http",
+      true,
+      undefined,
+      `Joongna returned HTTP ${response.status}`,
+    );
+  if (!response.ok)
+    throw new DomainError(
+      "upstream_http",
+      false,
+      undefined,
+      `Joongna returned HTTP ${response.status}`,
+    );
+  try {
+    return await response.json();
+  } catch (error) {
+    if (
+      (error instanceof DOMException &&
+        (error.name === "TimeoutError" || error.name === "AbortError")) ||
+      (error instanceof Error &&
+        (error.name === "TimeoutError" || error.name === "AbortError"))
+    )
+      throw new DomainError(
+        "timeout",
+        true,
+        undefined,
+        "Joongna response decoding timed out",
+      );
+    throw new DomainError(
+      "parse_failed",
+      false,
+      undefined,
+      "Joongna returned invalid JSON",
+    );
+  }
+}
+function retryAfterSeconds(value: string | null): number | undefined {
+  if (value === null || !value.trim()) return undefined;
+  const seconds = Number(value.trim());
+  return Number.isSafeInteger(seconds) && seconds >= 0 ? seconds : undefined;
+}
+function effectiveSearchWord(input: {
+  query?: string;
+  search_word?: string;
+}): string {
+  if (input.search_word?.trim()) return input.search_word;
+  if (input.query?.trim()) {
     try {
-      yield JSON.parse(payload) as JsonValue;
-    } catch {
+      return normalizeSearchWord(input.query);
+    } catch (error) {
+      throw new DomainError(
+        "invalid_query",
+        false,
+        undefined,
+        error instanceof Error ? error.message : "Query is unusable",
+      );
+    }
+  }
+  throw new DomainError(
+    "invalid_query",
+    false,
+    undefined,
+    "Provide query or a nonblank search_word",
+  );
+}
+function searchIdentity(input: SearchInput, searchWord: string) {
+  return {
+    searchWord,
+    minPrice: input.min_price_krw ?? null,
+    maxPrice: input.max_price_krw ?? null,
+    statuses: [...new Set(input.statuses ?? [])].sort(),
+    sort: input.sort ?? "recent",
+    pageSize: SEARCH_PAGE_SIZE,
+  };
+}
+function encodeCursor(state: JsonRecord): string {
+  const bytes = new TextEncoder().encode(JSON.stringify(state));
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+function decodeCursor(cursor: string): JsonRecord {
+  if (cursor.length > 4096 || !/^[A-Za-z0-9_-]+$/.test(cursor))
+    throw new DomainError(
+      "cursor_mismatch",
+      false,
+      undefined,
+      "Cursor is malformed",
+    );
+  try {
+    const binary = atob(
+      cursor.replace(/-/g, "+").replace(/_/g, "/") +
+        "=".repeat((4 - (cursor.length % 4)) % 4),
+    );
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    return record(JSON.parse(new TextDecoder().decode(bytes)));
+  } catch {
+    throw new DomainError(
+      "cursor_mismatch",
+      false,
+      undefined,
+      "Cursor is malformed",
+    );
+  }
+}
+function cursorFor(
+  input: SearchInput,
+  searchWord: string,
+): { page: number; key: ReturnType<typeof searchIdentity> } {
+  const key = searchIdentity(input, searchWord);
+  if (!input.cursor) return { page: 0, key };
+  const state = decodeCursor(input.cursor);
+  if (
+    state.v !== 1 ||
+    state.m !== "joongna" ||
+    JSON.stringify(state.key) !== JSON.stringify(key) ||
+    !Number.isInteger(state.page) ||
+    Number(state.page) < 0 ||
+    Number(state.page) > 10000
+  )
+    throw new DomainError(
+      "cursor_mismatch",
+      false,
+      undefined,
+      "Cursor does not match this search",
+    );
+  return { page: Number(state.page), key };
+}
+function nativePayload(
+  input: SearchInput,
+  searchWord: string,
+  page: number,
+): JsonRecord {
+  const statuses = input.statuses ?? [];
+  return {
+    osType: 2,
+    firstQuantity: SEARCH_PAGE_SIZE,
+    quantity: SEARCH_PAGE_SIZE,
+    jnPayYn: "ALL",
+    categoryFilter: [{ categoryDepth: 0, categorySeq: 0 }],
+    priceFilter: {
+      minPrice: input.min_price_krw ?? 0,
+      maxPrice: input.max_price_krw ?? 100000000,
+    },
+    sort:
+      input.sort === "price_low"
+        ? "PRICE_ASC_SORT"
+        : input.sort === "price_high"
+          ? "PRICE_DESC_SORT"
+          : "RECENT_SORT",
+    saleYn: statuses.includes("sold") ? "SALE_Y" : "SALE_N",
+    parcelFeeYn: "ALL",
+    page,
+    searchWord,
+    adjustSearchKeyword: true,
+    keywordSource: "INPUT_KEYWORD",
+    registPeriod: "ALL",
+  };
+}
+function extractSearch(payload: unknown): {
+  items: JsonRecord[];
+  total: number | null;
+} {
+  const root = record(payload);
+  const data = record(root.data);
+  const meta = record(data.meta ?? root.meta);
+  if (meta.code !== undefined && Number(meta.code) !== 0)
+    throw new DomainError(
+      "upstream_http",
+      true,
+      undefined,
+      String(meta.message ?? "Joongna search failed"),
+    );
+  if (!Array.isArray(data.items))
+    throw new DomainError(
+      "parse_failed",
+      false,
+      undefined,
+      "Joongna search response did not contain an items array",
+    );
+  if (
+    data.items.some(
+      (x) => typeof x !== "object" || x === null || Array.isArray(x),
+    )
+  )
+    throw new DomainError(
+      "parse_failed",
+      false,
+      undefined,
+      "Joongna search response contained a malformed item",
+    );
+  return {
+    items: data.items as JsonRecord[],
+    total: intOrNull(data.totalSize),
+  };
+}
+function isExternalAd(item: JsonRecord): boolean {
+  const type = String(
+    item.objectType ?? item.type ?? item.adType ?? "",
+  ).toLowerCase();
+  return (
+    type.includes("external") ||
+    type === "ext_ad" ||
+    type === "shopping_ad" ||
+    item.externalAd === true
+  );
+}
+function listingFromItem(
+  item: JsonRecord,
+  config: ReturnType<typeof configFrom>,
+  observedAt: string,
+): Listing {
+  const listingId = firstSourceId(item.seq, item.productSeq, item.id);
+  if (listingId === null)
+    throw new DomainError(
+      "parse_failed",
+      false,
+      undefined,
+      "Joongna listing did not contain an ID",
+    );
+  const thumbnail = typeof item.url === "string" && item.url ? item.url : null;
+  const status = saleStatusFromState(item.state);
+  const seller = firstSourceId(item.storeSeq, item.sellerId);
+  return {
+    marketplace: "joongna",
+    listing_id: listingId,
+    listing_url:
+      typeof item.articleUrl === "string" && item.articleUrl
+        ? item.articleUrl.startsWith("http")
+          ? item.articleUrl
+          : config.listingBase + item.articleUrl
+        : `${config.listingBase}/product/${listingId}`,
+    title: String(item.title ?? item.name ?? ""),
+    description: null,
+    price_krw: priceOrNull(item.price),
+    status,
+    raw_status: item.state === undefined ? null : String(item.state),
+    seller_id: seller,
+    category: {
+      id: stringOrNull(item.categorySeq ?? item.categoryId),
+      name: stringOrNull(item.categoryName),
+    },
+    observed_at: observedAt,
+    created_at: stringOrNull(item.createdAt),
+    updated_at: stringOrNull(item.updatedAt),
+    sold_at: null,
+    detail_status: "not_requested",
+    detail_checked_at: null,
+    detail_error: null,
+    seller_evidence_status: "not_requested",
+    seller_checked_at: null,
+    seller_error: null,
+    seller_evidence: null,
+    thumbnail_url: thumbnail,
+    image_urls: thumbnail ? [thumbnail] : [],
+    promoted_marketplace_product:
+      typeof item.promoted === "boolean" ? item.promoted : null,
+    source_flags: {
+      jnPayBadgeFlag:
+        typeof item.jnPayBadgeFlag === "boolean" ? item.jnPayBadgeFlag : null,
+      pickupBadgeFlag:
+        typeof item.pickupBadgeFlag === "boolean" ? item.pickupBadgeFlag : null,
+      certifiedSellerFlag:
+        typeof item.certifySellerFlag === "boolean"
+          ? item.certifySellerFlag
+          : null,
+    },
+    source_dates: {
+      sortDate: stringOrNull(item.sortDate),
+      updateDate: stringOrNull(item.updateDate),
+    },
+  };
+}
+function filterItems(
+  items: JsonRecord[],
+  input: SearchInput,
+  config: ReturnType<typeof configFrom>,
+  observedAt: string,
+) {
+  const requested = input.statuses?.length
+    ? [...new Set(input.statuses)]
+    : null;
+  const excluded = { status: 0, external_ad: 0, unknown_status: 0 };
+  const listings: Listing[] = [];
+  for (const item of items) {
+    if (isExternalAd(item)) {
+      excluded.external_ad++;
       continue;
     }
-  }
-}
-
-function* iterHydratedQueries(html: string): Generator<JsonObject> {
-  for (const root of iterFlightPayloads(html)) {
-    const stack: JsonValue[] = [root];
-    while (stack.length > 0) {
-      const node = stack.pop();
-      if (Array.isArray(node)) {
-        for (const item of node) stack.push(item);
-      } else if (isObject(node)) {
-        const queries = node["queries"];
-        if (Array.isArray(queries)) {
-          for (const query of queries) {
-            if (isObject(query)) yield query;
-          }
-        }
-        for (const value of Object.values(node)) stack.push(value);
+    const listing = listingFromItem(item, config, observedAt);
+    if (requested) {
+      if (listing.status === "unknown") {
+        excluded.unknown_status++;
+        continue;
+      }
+      if (!requested.includes(listing.status as RequestedStatus)) {
+        excluded.status++;
+        continue;
       }
     }
+    listings.push(listing);
   }
+  return { listings, excluded, requested };
 }
-
-function iterSearchItems(html: string): JsonObject[] {
-  for (const root of iterFlightPayloads(html)) {
-    const stack: JsonValue[] = [root];
-    while (stack.length > 0) {
-      const node = stack.pop();
-      if (Array.isArray(node)) {
-        for (const item of node) stack.push(item);
-      } else if (isObject(node)) {
-        const items = node["items"];
-        if (
-          Array.isArray(items) &&
-          items.length > 0 &&
-          isObject(items[0]) &&
-          "seq" in items[0]
-        ) {
-          return items as JsonObject[];
-        }
-        for (const value of Object.values(node)) stack.push(value);
-      }
-    }
-  }
-  return [];
+function detailErrorCode(error: unknown): { code: string; retryable: boolean } {
+  const e =
+    error instanceof DomainError
+      ? error
+      : new DomainError("upstream_blocked", true);
+  return { code: e.code, retryable: e.retryable };
 }
-
-function parseSummary(html: string): PriceSummaryData {
-  const labelMap: Record<string, keyof PriceSummaryData> = {
-    "평균 가격": "average_price_krw",
-    "가장 높은 가격": "highest_price_krw",
-    "가장 낮은 가격": "lowest_price_krw",
-  };
-  const summary: PriceSummaryData = {
-    average_price_krw: null,
-    highest_price_krw: null,
-    lowest_price_krw: null,
-  };
-  SUMMARY_RE.lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = SUMMARY_RE.exec(html)) !== null) {
-    const key = labelMap[match[1]];
-    if (key) summary[key] = parseKrw(match[2]);
-  }
-  return summary;
-}
-
-function summaryIsEmpty(summary: PriceSummaryData): boolean {
-  return (
-    summary.average_price_krw === null &&
-    summary.highest_price_krw === null &&
-    summary.lowest_price_krw === null
-  );
-}
-
-function strOrNull(value: JsonValue | undefined): string | null {
-  if (value === undefined || value === null) return null;
-  return String(value);
-}
-
-function intOrNull(value: JsonValue | undefined): number | null {
-  if (value === undefined || value === null) return null;
-  const parsed = Number.parseInt(String(value), 10);
-  return Number.isNaN(parsed) ? null : parsed;
-}
-
-function boolOrNull(value: JsonValue | undefined): boolean | null {
-  if (value === undefined || value === null) return null;
-  return Boolean(value);
-}
-
-function buildMetadata(data: JsonObject): SearchMetadataData | null {
-  const searchKeyword = data["searchKeyword"];
-  const selectedExposureKeyword = data["selectExposureKeyword"];
-  const selectedModelName = data["selectModelName"];
-  const selectedOptionName = data["selectOptionName"];
-
-  const hasAny = [searchKeyword, selectedExposureKeyword, selectedModelName, selectedOptionName].some(
-    (value) => value !== undefined && value !== null && value !== "",
-  );
-  if (!hasAny) return null;
-
-  return {
-    search_keyword: strOrNull(searchKeyword),
-    selected_exposure_keyword: strOrNull(selectedExposureKeyword),
-    selected_model_name: strOrNull(selectedModelName),
-    selected_option_name: strOrNull(selectedOptionName),
-  };
-}
-
-// Joongna's listing payloads carry sale state as a bare integer. Verified
-// against product pages: 0 shows no badge, 1 shows 예약중, 3 shows 판매완료.
-// Unrecognized codes keep their number so they stay debuggable.
-
-export function saleStatusFromState(state: number | null): SaleStatus | null {
-  if (state === null) return null;
-  if (state === 0) return "on_sale";
-  if (state === 1) return "reserved";
-  if (state === 3) return "sold";
-  return `unknown_${state}`;
-}
-
-function buildListing(item: JsonObject): ListingData {
-  const sequence = intOrNull(item["seq"]) as number;
-  const articleUrl = item["articleUrl"];
-  let listingUrl: string;
-  if (typeof articleUrl === "string" && articleUrl) {
-    listingUrl = articleUrl.startsWith("http")
-      ? articleUrl
-      : "https://web.joongna.com" + articleUrl;
-  } else {
-    listingUrl = "https://web.joongna.com/product/" + sequence;
-  }
-
-  const thumbnailUrl = typeof item["url"] === "string" && item["url"] ? item["url"] : null;
-
-  return {
-    sequence,
-    title: unescapeHtml(String(item["title"] ?? "")),
-    price_krw: Number.parseInt(String(item["price"] ?? 0), 10) || 0,
-    listing_url: listingUrl,
-    thumbnail_url: thumbnailUrl,
-    description: null,
-    image_urls: thumbnailUrl ? [thumbnailUrl] : [],
-    // Empty strings are nulls here, as they were in the Python (`or None`).
-    sorted_at: strOrNull(item["sortDate"] || null),
-    location_name: strOrNull(item["mainLocationName"] || null),
-    parcel_fee_krw: intOrNull(item["parcelFee"]),
-    chat_count: intOrNull(item["chatCount"]),
-    wish_count: intOrNull(item["wishCount"]),
-    pickup_badge: boolOrNull(item["pickupBadgeFlag"]),
-    certified_seller: boolOrNull(item["certifySellerFlag"]),
-    sale_status: saleStatusFromState(intOrNull(item["state"])),
-  };
-}
-
-function flattenScatterPoints(
-  rawScatterPrices: JsonValue,
-): Array<{ date_hour: string; price_krw: number; count: number }> {
-  const points: Array<{ date_hour: string; price_krw: number; count: number }> = [];
-  if (!Array.isArray(rawScatterPrices)) return points;
-
-  for (const group of rawScatterPrices) {
-    if (!isObject(group)) continue;
-    const dateHour = group["dateHour"];
-    if (!dateHour) continue;
-    const priceCounts = group["priceCounts"];
-    if (!Array.isArray(priceCounts)) continue;
-    for (const priceCount of priceCounts) {
-      if (!isObject(priceCount)) continue;
-      const price = priceCount["price"];
-      const count = priceCount["count"];
-      if (price === null || price === undefined || count === null || count === undefined) continue;
-      const parsedPrice = intOrNull(price);
-      const parsedCount = intOrNull(count);
-      if (parsedPrice === null || parsedCount === null) continue;
-      points.push({
-        date_hour: String(dateHour),
-        price_krw: parsedPrice,
-        count: parsedCount,
-      });
-    }
-  }
-  return points;
-}
-
-function buildHistoryDataset(sourceKey: "BID" | "EXECUTION", data: JsonObject): PriceHistoryDatasetData {
-  const productPrice = isObject(data["productPrice"]) ? (data["productPrice"] as JsonObject) : {};
-  const items = Array.isArray(data["items"]) ? data["items"] : [];
-
-  const dailyAveragePrices: Array<{ date: string; average_price_krw: number }> = [];
-  const linePrices = productPrice["linePrices"];
-  if (Array.isArray(linePrices)) {
-    for (const point of linePrices) {
-      if (!isObject(point)) continue;
-      if (point["date"] === null || point["date"] === undefined) continue;
-      if (point["avgPrice"] === null || point["avgPrice"] === undefined) continue;
-      const averagePrice = intOrNull(point["avgPrice"]);
-      if (averagePrice === null) continue;
-      dailyAveragePrices.push({
-        date: String(point["date"]),
-        average_price_krw: averagePrice,
-      });
-    }
-  }
-
-  return {
-    source_key: sourceKey,
-    label_ko: sourceKey === "BID" ? "등록가" : "판매가",
-    listing_count: items.length,
-    daily_average_prices: dailyAveragePrices,
-    hourly_scatter_points: flattenScatterPoints(productPrice["scatterPrices"] ?? []),
-    listings: items
-      .filter((item): item is JsonObject => isObject(item) && intOrNull(item["seq"]) !== null)
-      .map(buildListing),
-  };
-}
-
-function parseHydratedDatasets(html: string): {
-  datasets: Partial<Record<"BID" | "EXECUTION", PriceHistoryDatasetData>>;
-  metadata: SearchMetadataData | null;
-  hasEmptyResultMarker: boolean;
+function parseDetail(payload: unknown): {
+  description: string | null;
+  image_urls: string[];
 } {
-  const datasets: Partial<Record<"BID" | "EXECUTION", PriceHistoryDatasetData>> = {};
-  let metadata: SearchMetadataData | null = null;
-  let hasEmptyResultMarker = false;
-
-  for (const query of iterHydratedQueries(html)) {
-    const queryKey = query["queryKey"];
-    if (!Array.isArray(queryKey) || queryKey.length < 2) continue;
-    if (queryKey[0] !== "postProductPriceScatterPlot") continue;
-
-    const sourceKey = String(queryKey[1]).toUpperCase();
-    if (sourceKey !== "BID" && sourceKey !== "EXECUTION") continue;
-
-    const state = isObject(query["state"]) ? (query["state"] as JsonObject) : {};
-    const dataOuter = isObject(state["data"]) ? (state["data"] as JsonObject) : {};
-    const data = isObject(dataOuter["data"]) ? (dataOuter["data"] as JsonObject) : {};
-
-    if (metadata === null) metadata = buildMetadata(data);
-    if (data["emptyResult"] !== null && data["emptyResult"] !== undefined) {
-      hasEmptyResultMarker = true;
+  validateNativeEnvelope(payload, "Joongna detail");
+  const data = record(record(payload).data);
+  if (
+    Object.keys(data).length === 0 ||
+    (data.productSeq === undefined &&
+      data.productDescription === undefined &&
+      !Array.isArray(data.media) &&
+      !Array.isArray(data.descriptionMedia))
+  )
+    throw new DomainError(
+      "parse_failed",
+      false,
+      undefined,
+      "Joongna detail response did not contain data",
+    );
+  const images: string[] = [];
+  const seen = new Set<string>();
+  for (const key of ["media", "descriptionMedia"])
+    for (const item of Array.isArray(data[key]) ? data[key] : []) {
+      const media = record(item);
+      if (media.mediaType !== undefined && media.mediaType !== 0) continue;
+      const url = media.originUrl ?? media.mediaUrl;
+      if (typeof url === "string" && url && !seen.has(url)) {
+        seen.add(url);
+        images.push(url);
+      }
     }
-    datasets[sourceKey] = buildHistoryDataset(sourceKey, data);
-  }
-
-  return { datasets, metadata, hasEmptyResultMarker };
+  return {
+    description:
+      data.productDescription === undefined || data.productDescription === null
+        ? null
+        : String(data.productDescription),
+    image_urls: images,
+  };
 }
-
-export function parseSearchPricePage(
-  html: string,
-  opts: { query: string; searchWord: string; sourceUrl: string; fetchedAt: string },
-): SearchPriceResult {
-  const summary = parseSummary(html);
-  const parsed = parseHydratedDatasets(html);
-  const datasets = parsed.datasets;
-  const hasEmptyResultMarker = parsed.hasEmptyResultMarker;
-  let metadata = parsed.metadata;
-
-  const availableListings =
-    (datasets.BID && datasets.BID.listings.length > 0 && datasets.BID.listings) ||
-    (datasets.EXECUTION && datasets.EXECUTION.listings.length > 0 && datasets.EXECUTION.listings) ||
-    [];
-
-  const hasDatasets = datasets.BID !== undefined || datasets.EXECUTION !== undefined;
-  const emptyResult =
-    hasEmptyResultMarker || (!hasDatasets && availableListings.length === 0 && summaryIsEmpty(summary));
-
-  if (emptyResult && metadata === null) {
-    metadata = {
-      search_keyword: opts.searchWord,
-      selected_exposure_keyword: null,
-      selected_model_name: null,
-      selected_option_name: null,
+async function enrichDetails(
+  config: ReturnType<typeof configFrom>,
+  listings: Listing[],
+): Promise<boolean> {
+  const ids = [...new Set(listings.map((x) => x.listing_id))];
+  let next = 0;
+  let failed = false;
+  const details = new Map<
+    string,
+    {
+      value?: ReturnType<typeof parseDetail>;
+      error?: { code: string; retryable: boolean };
+    }
+  >();
+  async function lane() {
+    while (next < ids.length) {
+      const id = ids[next++];
+      const checked = isoNow();
+      try {
+        const value = parseDetail(
+          await fetchJson(
+            config,
+            `${PRODUCT_API}/basic/${encodeURIComponent(id)}?increaseViewCount=false`,
+            { headers: { accept: "application/json" } },
+          ),
+        );
+        details.set(id, { value });
+      } catch (error) {
+        failed = true;
+        details.set(id, { error: detailErrorCode(error) });
+      }
+      for (const listing of listings.filter((x) => x.listing_id === id)) {
+        listing.detail_checked_at = checked;
+        const detail = details.get(id);
+        if (detail?.value) {
+          listing.detail_status = "available";
+          listing.description = detail.value.description;
+          if (detail.value.image_urls.length)
+            listing.image_urls = detail.value.image_urls;
+        } else {
+          listing.detail_status = "failed";
+          listing.detail_error = detail?.error ?? {
+            code: "upstream_blocked",
+            retryable: true,
+          };
+        }
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(DETAIL_CONCURRENCY, ids.length) }, () =>
+      lane(),
+    ),
+  );
+  return failed;
+}
+async function fetchSeller(
+  config: ReturnType<typeof configFrom>,
+  sellerId: string,
+) {
+  const checkedAt = isoNow();
+  try {
+    const response = record(
+      await fetchJson(
+        config,
+        `${MAIN_API}/v2/my-store/${encodeURIComponent(sellerId)}`,
+        { headers: { accept: "application/json" } },
+      ),
+    );
+    validateNativeEnvelope(response, "Joongna seller");
+    const data = record(response.data);
+    if (Object.keys(data).length === 0)
+      throw new DomainError(
+        "parse_failed",
+        false,
+        undefined,
+        "Joongna seller response did not contain data",
+      );
+    const safe = intOrNull(data.safeTradeCount);
+    const review = intOrNull(data.reviewCount);
+    const sourcePayload = {
+      safeTradeCount: data.safeTradeCount ?? null,
+      reviewCount: data.reviewCount ?? null,
+    };
+    if (safe === null || safe < 0)
+      return {
+        marketplace: "joongna" as const,
+        seller_id: sellerId,
+        checked_at: checkedAt,
+        status: "unavailable" as const,
+        source_metrics: {
+          safeTradeCount: null,
+          reviewCount: review !== null && review >= 0 ? review : null,
+        },
+        safe_trade_count: {
+          value: null,
+          status: "unavailable" as const,
+          source_field: "safeTradeCount" as const,
+          role_scope: "unknown" as const,
+          reason: "invalid_source_metric",
+        },
+        source_payload: sourcePayload,
+        error: { code: "invalid_source_metric", retryable: false },
+      };
+    return {
+      marketplace: "joongna" as const,
+      seller_id: sellerId,
+      checked_at: checkedAt,
+      status: "available" as const,
+      source_metrics: {
+        safeTradeCount: safe,
+        reviewCount: review !== null && review >= 0 ? review : null,
+      },
+      safe_trade_count: {
+        value: safe,
+        status: "available" as const,
+        source_field: "safeTradeCount" as const,
+        role_scope: "unknown" as const,
+      },
+      source_payload: sourcePayload,
+      error: null,
+    };
+  } catch (error) {
+    const e = detailErrorCode(error);
+    return {
+      marketplace: "joongna" as const,
+      seller_id: sellerId,
+      checked_at: checkedAt,
+      status: "failed" as const,
+      source_metrics: { safeTradeCount: null, reviewCount: null },
+      safe_trade_count: {
+        value: null,
+        status: "failed" as const,
+        source_field: "safeTradeCount" as const,
+        role_scope: "unknown" as const,
+        reason: e.code,
+      },
+      source_payload: {},
+      error: e,
     };
   }
-
-  return {
-    query: opts.query,
-    search_word: opts.searchWord,
-    source_url: opts.sourceUrl,
-    fetched_at: opts.fetchedAt,
-    detail_failures: 0,
-    empty_result: emptyResult,
-    empty_result_reason: emptyResult ? "No pricing data found for this search word" : null,
-    summary,
-    metadata,
-    registered_price_history: datasets.BID ?? null,
-    sold_price_history: datasets.EXECUTION ?? null,
-    available_listings: availableListings,
-  };
 }
-
-export function parseSearchKeywordPage(
-  html: string,
-  opts: { query: string; searchWord: string; sourceUrl: string; fetchedAt: string },
-): SearchKeywordResult {
-  const items = iterSearchItems(html);
-  const listings = items
-    .filter((item) => intOrNull(item["seq"]) !== null)
-    .map(buildListing);
-
-  return {
-    query: opts.query,
-    search_word: opts.searchWord,
-    source_url: opts.sourceUrl,
-    fetched_at: opts.fetchedAt,
-    detail_failures: 0,
-    total_count: listings.length,
-    listings,
-  };
-}
-
-export function parseProductDetail(payload: JsonObject): { description: string | null; image_urls: string[] } {
-  const data = payload["data"];
-  if (!isObject(data)) {
-    throw new JoongnaParseError("Joongna product response did not contain product data");
-  }
-
-  const rawDescription = data["productDescription"];
-  const description = rawDescription === null || rawDescription === undefined ? null : String(rawDescription);
-
-  const imageUrls: string[] = [];
-  const seen = new Set<string>();
-  for (const collectionName of ["media", "descriptionMedia"]) {
-    const mediaItems = data[collectionName];
-    if (!Array.isArray(mediaItems)) continue;
-    for (const media of mediaItems) {
-      if (!isObject(media)) continue;
-      const mediaType = media["mediaType"];
-      if (mediaType !== null && mediaType !== undefined && mediaType !== 0) continue;
-      const imageUrl = media["originUrl"] ?? media["mediaUrl"];
-      if (typeof imageUrl === "string" && imageUrl && !seen.has(imageUrl)) {
-        seen.add(imageUrl);
-        imageUrls.push(imageUrl);
-      }
+async function enrichSellers(
+  config: ReturnType<typeof configFrom>,
+  listings: Listing[],
+): Promise<boolean> {
+  const ids = [
+    ...new Set(
+      listings.map((x) => x.seller_id).filter((x): x is string => Boolean(x)),
+    ),
+  ];
+  let next = 0;
+  let partial = false;
+  const byId = new Map<string, Awaited<ReturnType<typeof fetchSeller>>>();
+  async function lane() {
+    while (next < ids.length) {
+      const id = ids[next++];
+      byId.set(id, await fetchSeller(config, id));
     }
   }
-
-  return { description, image_urls: imageUrls };
-}
-
-// --- service -----------------------------------------------------------------
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-/** Null when the detail could not be fetched or parsed; the listing then keeps its search-page fields. */
-async function getListingDetails(
-  config: ClientConfig,
-  sequence: number,
-): Promise<{ description: string | null; image_urls: string[] } | null> {
-  try {
-    const payload = await fetchProductDetail(config, sequence);
-    return parseProductDetail(payload);
-  } catch (err) {
-    if (err instanceof JoongnaFetchError || err instanceof JoongnaParseError) return null;
-    throw err;
-  }
-}
-
-/** Enriches in place; returns how many unique listings could not be enriched. */
-async function enrichListings(config: ClientConfig, listings: ListingData[]): Promise<number> {
-  const sequences = [...new Set(listings.map((listing) => listing.sequence))];
-  if (sequences.length === 0) return 0;
-
-  const detailsList = await Promise.all(
-    sequences.map((sequence) => getListingDetails(config, sequence)),
+  await Promise.all(
+    Array.from({ length: Math.min(DETAIL_CONCURRENCY, ids.length) }, () =>
+      lane(),
+    ),
   );
-  const detailsBySequence = new Map(sequences.map((sequence, i) => [sequence, detailsList[i]]));
-
   for (const listing of listings) {
-    const details = detailsBySequence.get(listing.sequence);
-    if (!details) continue;
-    listing.description = details.description;
-    if (details.image_urls.length > 0) {
-      listing.image_urls = [...details.image_urls];
+    listing.seller_checked_at = isoNow();
+    if (!listing.seller_id) {
+      listing.seller_evidence_status = "unavailable";
+      listing.seller_error = { code: "missing_seller_id", retryable: false };
+      partial = true;
+      continue;
+    }
+    const evidence = byId.get(listing.seller_id);
+    if (!evidence) {
+      listing.seller_evidence_status = "failed";
+      listing.seller_error = { code: "seller_fetch_failed", retryable: true };
+      partial = true;
+      continue;
+    }
+    listing.seller_evidence = evidence;
+    listing.seller_evidence_status = evidence.status;
+    if (evidence.status !== "available") {
+      listing.seller_error = {
+        code:
+          evidence.error?.code ??
+          evidence.safe_trade_count.reason ??
+          "seller_fetch_failed",
+        retryable: evidence.error?.retryable ?? false,
+      };
+      partial = true;
     }
   }
-  return detailsList.filter((details) => details === null).length;
+  return partial;
 }
-
-function limitPriceResult(result: SearchPriceResult, maxListings: number): SearchPriceResult {
-  result.available_listings = result.available_listings.slice(0, maxListings);
-  if (result.registered_price_history) {
-    result.registered_price_history.listings = result.registered_price_history.listings.slice(0, maxListings);
+async function fetchSellerBatch(
+  config: ReturnType<typeof configFrom>,
+  ids: string[],
+): Promise<Map<string, Awaited<ReturnType<typeof fetchSeller>>>> {
+  const values = new Map<string, Awaited<ReturnType<typeof fetchSeller>>>();
+  let next = 0;
+  async function lane() {
+    while (next < ids.length) {
+      const id = ids[next++];
+      values.set(id, await fetchSeller(config, id));
+    }
   }
-  if (result.sold_price_history) {
-    result.sold_price_history.listings = result.sold_price_history.listings.slice(0, maxListings);
-  }
-  return result;
+  await Promise.all(
+    Array.from({ length: Math.min(DETAIL_CONCURRENCY, ids.length) }, () =>
+      lane(),
+    ),
+  );
+  return values;
 }
-
-function limitKeywordResult(result: SearchKeywordResult, maxListings: number): SearchKeywordResult {
-  result.listings = result.listings.slice(0, maxListings);
-  result.total_count = result.listings.length;
-  return result;
-}
-
-async function searchPrice(
-  config: ClientConfig,
-  args: { query: string; searchWord?: string; maxListings: number },
-): Promise<SearchPriceResult> {
-  if (args.maxListings < 1) throw new Error("max_listings must be at least 1");
-
-  const effectiveSearchWord = args.searchWord?.trim() || normalizeSearchWord(args.query);
-  const [sourceUrl, html] = await fetchSearchPage(config, effectiveSearchWord);
-  const fetchedAt = new Date().toISOString();
-  const result = parseSearchPricePage(html, {
-    query: args.query,
-    searchWord: effectiveSearchWord,
-    sourceUrl,
-    fetchedAt,
-  });
-
-  const limited = limitPriceResult(result, args.maxListings);
-  const groups: ListingData[] = [...limited.available_listings];
-  if (limited.registered_price_history) groups.push(...limited.registered_price_history.listings);
-  if (limited.sold_price_history) groups.push(...limited.sold_price_history.listings);
-  limited.detail_failures = await enrichListings(config, groups);
-  return limited;
-}
-
-async function searchKeyword(
-  config: ClientConfig,
-  args: { query: string; searchWord?: string; maxListings: number },
-): Promise<SearchKeywordResult> {
-  if (args.maxListings < 1) throw new Error("max_listings must be at least 1");
-
-  const effectiveSearchWord = args.searchWord?.trim() || normalizeSearchWord(args.query);
-  let result: SearchKeywordResult | null = null;
-
-  for (let attempt = 0; attempt < KEYWORD_MAX_RETRIES; attempt++) {
-    const [sourceUrl, html] = await fetchSearchKeywordPage(config, effectiveSearchWord);
-    const fetchedAt = new Date().toISOString();
-    result = parseSearchKeywordPage(html, {
-      query: args.query,
-      searchWord: effectiveSearchWord,
-      sourceUrl,
-      fetchedAt,
-    });
-    if (result.listings.length > 0) break;
-    if (attempt < KEYWORD_MAX_RETRIES - 1) await sleep(KEYWORD_RETRY_DELAY_MS);
-  }
-
-  const limited = limitKeywordResult(result as SearchKeywordResult, args.maxListings);
-  limited.detail_failures = await enrichListings(config, limited.listings);
-  return limited;
-}
-
-// --- MCP server --------------------------------------------------------------
-
-function toolResult<T extends object>(value: T): {
-  content: Array<{ type: "text"; text: string }>;
-  structuredContent: Record<string, unknown>;
-} {
+const SellerSuccessSchema = z.object({
+  outcome: z.literal("ok"),
+  sellers: z.array(SellerEvidenceSchema),
+});
+const SellerPartialSchema = z.object({
+  outcome: z.literal("partial"),
+  sellers: z.array(SellerEvidenceSchema),
+});
+const SellerOutputSchema = z
+  .discriminatedUnion("outcome", [SellerSuccessSchema, SellerPartialSchema])
+  .meta({ type: "object" });
+function errorResult(
+  error: unknown,
+  requestCursor: string | null,
+  base?: Partial<SearchListingsResponse>,
+): SearchListingsResponse {
+  const e =
+    error instanceof DomainError
+      ? error
+      : new DomainError("upstream_blocked", true);
   return {
-    content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
-    structuredContent: value as Record<string, unknown>,
+    outcome: "error",
+    ...base,
+    error: {
+      code: e.code,
+      retryable: e.retryable,
+      ...(e.retryAfter === undefined
+        ? {}
+        : { retry_after_seconds: e.retryAfter }),
+      message: e.message,
+    },
+    request_cursor: requestCursor,
+    pagination: { next_cursor: null, has_more: null },
+  } as SearchListingsResponse;
+}
+export async function searchListings(
+  env: Env,
+  input: SearchInput,
+): Promise<SearchListingsResponse> {
+  const config = configFrom(env);
+  let searchWord = "";
+  let effectiveRequest: JsonRecord | undefined;
+  const requestCursor = input.cursor ?? null;
+  try {
+    if (
+      input.min_price_krw !== undefined &&
+      input.max_price_krw !== undefined &&
+      input.min_price_krw > input.max_price_krw
+    )
+      throw new DomainError(
+        "invalid_query",
+        false,
+        undefined,
+        "min_price_krw must not exceed max_price_krw",
+      );
+    searchWord = effectiveSearchWord(input);
+    const cursor = cursorFor(input, searchWord);
+    effectiveRequest = nativePayload(input, searchWord, cursor.page);
+    const payload = await fetchJson(
+      config,
+      `${config.searchApi}/v3/search/all`,
+      {
+        method: "POST",
+        body: JSON.stringify(effectiveRequest),
+      },
+    );
+    const extracted = extractSearch(payload);
+    const observedAt = isoNow();
+    const filtered = filterItems(extracted.items, input, config, observedAt);
+    let partial = false;
+    if (input.include_details !== false && filtered.listings.length) {
+      const detailPartial = await enrichDetails(config, filtered.listings);
+      partial = partial || detailPartial;
+    }
+    if (input.include_seller_evidence && filtered.listings.length) {
+      const sellerPartial = await enrichSellers(config, filtered.listings);
+      partial = partial || sellerPartial;
+    }
+    for (const listing of filtered.listings) {
+      if (input.include_details === false)
+        listing.detail_status = "not_requested";
+      if (!input.include_seller_evidence)
+        listing.seller_evidence_status = "not_requested";
+    }
+    const hasMore = extracted.items.length === 0 ? false : null;
+    const nextCursor =
+      extracted.items.length === 0
+        ? null
+        : encodeCursor({
+            v: 1,
+            m: "joongna",
+            key: cursor.key,
+            page: cursor.page + 1,
+          });
+    return {
+      outcome: partial ? "partial" : "ok",
+      page_observed_at: observedAt,
+      effective_request: effectiveRequest,
+      applied_filters: {
+        price: { upstream: "range", post_filter: false },
+        status: {
+          requested: filtered.requested,
+          upstream: (input.statuses ?? []).includes("sold")
+            ? "include_sold"
+            : "exclude_sold",
+          post_filter: filtered.requested,
+        },
+      },
+      scanned_count: extracted.items.length,
+      returned_count: filtered.listings.length,
+      excluded_counts: filtered.excluded,
+      listings: filtered.listings,
+      pagination: {
+        native_page_size: SEARCH_PAGE_SIZE,
+        raw_count: extracted.items.length,
+        next_cursor: nextCursor,
+        has_more: hasMore,
+        total_count: { value: null, kind: "unavailable" },
+      },
+      warnings: [
+        {
+          code: "classification_boundary",
+          message:
+            "Marketplace status and price filters do not classify product model or transaction eligibility.",
+        },
+      ],
+    };
+  } catch (error) {
+    return errorResult(
+      error,
+      requestCursor,
+      effectiveRequest ? { effective_request: effectiveRequest } : undefined,
+    );
+  }
+}
+
+async function fetchChart(
+  config: ReturnType<typeof configFrom>,
+  searchWord: string,
+  dateRange: 30 | 90 | 180,
+  sourceLabel: "registered_price" | "sales_price",
+): Promise<JsonRecord> {
+  const root = record(
+    await fetchJson(
+      config,
+      `${config.searchApi}/v4/analysis/product-price/scatter-plot`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          searchWord,
+          priceType: sourceLabel === "registered_price" ? 0 : 1,
+          productPriceSize: 1,
+          dateRange,
+        }),
+      },
+    ),
+  );
+  validateNativeEnvelope(root, "Joongna chart");
+  const data = record(root.data);
+  return Object.keys(data).length ? data : root;
+}
+function chartFromPayload(
+  data: JsonRecord,
+  config: ReturnType<typeof configFrom>,
+  observedAt: string,
+  requestedRange: 30 | 90 | 180,
+  maxRelated: number,
+  sourceLabel: "registered_price" | "sales_price",
+): z.infer<typeof ChartSchema> {
+  if (
+    !data.productPrice ||
+    typeof data.productPrice !== "object" ||
+    Array.isArray(data.productPrice)
+  )
+    throw new DomainError(
+      "parse_failed",
+      false,
+      undefined,
+      "Joongna chart response did not contain productPrice",
+    );
+  const productPrice = record(data.productPrice);
+  if (
+    !Array.isArray(productPrice.linePrices) ||
+    !Array.isArray(productPrice.scatterPrices)
+  )
+    throw new DomainError(
+      "parse_failed",
+      false,
+      undefined,
+      "Joongna chart response did not contain price series",
+    );
+  if (
+    productPrice.linePrices.some(
+      (x) => typeof x !== "object" || x === null || Array.isArray(x),
+    ) ||
+    productPrice.scatterPrices.some(
+      (x) => typeof x !== "object" || x === null || Array.isArray(x),
+    )
+  )
+    throw new DomainError(
+      "parse_failed",
+      false,
+      undefined,
+      "Joongna chart response contained malformed series data",
+    );
+  const line = productPrice.linePrices as JsonRecord[];
+  const scatter = productPrice.scatterPrices as JsonRecord[];
+  const dates = [
+    ...line.map((x) => stringOrNull(x.date)),
+    ...scatter.map((x) => stringOrNull(x.dateHour)?.slice(0, 10)),
+  ]
+    .filter(
+      (x): x is string =>
+        typeof x === "string" &&
+        /^\d{4}-\d{2}-\d{2}$/.test(x) &&
+        Number.isFinite(Date.parse(`${x}T00:00:00Z`)),
+    )
+    .sort();
+  if (
+    data.items !== undefined &&
+    (!Array.isArray(data.items) ||
+      data.items.some(
+        (x) => typeof x !== "object" || x === null || Array.isArray(x),
+      ))
+  )
+    throw new DomainError(
+      "parse_failed",
+      false,
+      undefined,
+      "Joongna chart response contained malformed related listings",
+    );
+  const items = (data.items ?? []) as JsonRecord[];
+  return {
+    source: "joongna",
+    source_label: sourceLabel,
+    requested_range: {
+      date_range: requestedRange,
+    },
+    observed_range: {
+      date_from: dates[0] ?? null,
+      date_to: dates.at(-1) ?? null,
+      inclusive_day_count: dates.length
+        ? Math.round(
+            (Date.parse(`${dates.at(-1)}T00:00:00Z`) -
+              Date.parse(`${dates[0]}T00:00:00Z`)) /
+              86400000,
+          ) + 1
+        : null,
+    },
+    completeness: "unknown",
+    weighting_semantics: "unknown",
+    population_semantics: "unknown",
+    line_prices: line,
+    scatter_prices: scatter,
+    native_scatter_price_count_avg: productPrice.scatterPriceCountAvg ?? null,
+    related_current_listings: items
+      .slice(0, maxRelated)
+      .map((item) => listingFromItem(item, config, observedAt)),
+    native_related_listing_count: items.length,
   };
 }
-
+const ChartInputSchema = z
+  .object({
+    query: z.string().optional(),
+    search_word: z.string().optional(),
+    date_range: z
+      .union([z.literal(30), z.literal(90), z.literal(180)])
+      .default(30),
+    source_label: z
+      .enum(["registered_price", "sales_price"])
+      .default("sales_price"),
+    max_related_listings: z.number().int().min(1).max(50).default(20),
+    include_details: z.boolean().default(true),
+  })
+  .strict();
+async function searchPrice(
+  env: Env,
+  input: z.infer<typeof ChartInputSchema>,
+): Promise<z.infer<typeof ChartOutputSchema>> {
+  const config = configFrom(env);
+  let searchWord = "";
+  try {
+    searchWord = effectiveSearchWord(input);
+    const observed = isoNow();
+    const chart = chartFromPayload(
+      await fetchChart(
+        config,
+        searchWord,
+        input.date_range,
+        input.source_label,
+      ),
+      config,
+      observed,
+      input.date_range,
+      input.max_related_listings,
+      input.source_label,
+    );
+    let partial = false;
+    if (input.include_details && chart.related_current_listings.length)
+      partial = await enrichDetails(config, chart.related_current_listings);
+    return {
+      outcome: partial ? "partial" : "ok",
+      page_observed_at: observed,
+      search_word: searchWord,
+      chart,
+      pagination: {
+        native_page_size: chart.native_related_listing_count,
+        raw_count: chart.native_related_listing_count,
+        next_cursor: null,
+        has_more: false,
+        total_count: { value: null, kind: "unavailable" },
+      },
+      warnings: [
+        {
+          code: "source_chart_limits",
+          message:
+            "This is a Joongna source chart with unknown population and weighting; it is not an exact transaction average.",
+        },
+      ],
+    };
+  } catch (error) {
+    const e =
+      error instanceof DomainError
+        ? error
+        : new DomainError("parse_failed", false);
+    return {
+      outcome: "error",
+      search_word: searchWord || undefined,
+      error: { code: e.code, retryable: e.retryable, message: e.message },
+      request_cursor: null,
+      pagination: { next_cursor: null, has_more: null },
+    } as z.infer<typeof ChartOutputSchema>;
+  }
+}
+function toolResult(value: object, isError = false) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }],
+    structuredContent: value as Record<string, unknown>,
+    ...(isError ? { isError: true } : {}),
+  };
+}
 function buildServer(env: Env): McpServer {
   const server = new McpServer(
-    { name: "joongna-mcp", version: "0.1.0" },
+    { name: "joongna-mcp", version: "0.2.0" },
     {
-      // The tool list and the discover document are static, so a 2026-07-28
-      // client may hold them for five minutes instead of re-fetching on every
-      // session. `private` because every request here arrives with a caller
-      // identity attached; nothing is meant for a shared cache.
       cacheHints: {
         "tools/list": { ttlMs: 300_000, cacheScope: "private" },
         "server/discover": { ttlMs: 300_000, cacheScope: "private" },
       },
     },
   );
-  const config = clientConfigFromEnv(env);
-
-  server.registerTool("joongna_search_price", { description: "Return Joongna price data and listings with descriptions and product images. Descriptions and images cost one upstream request per listing and can partially fail; detail_failures in the result counts the listings that came back without them.", inputSchema: z.object({
-              query: z.string().describe("Natural-language question or device name to search on Joongna"),
-              search_word: z
-                .string()
-                .optional()
-                .describe("Optional explicit Joongna search term override, ideally in Korean"),
-              max_listings: z
-                .number()
-                .int()
-                .min(1)
-                .max(20)
-                .default(10)
-                .describe("Maximum listings to return per dataset"),
-            }), outputSchema: SearchPriceResultSchema }, async ({ query, search_word, max_listings }) => {
-              const result = await searchPrice(config, { query, searchWord: search_word, maxListings: max_listings });
-              return toolResult(result);
-            });
-
-  server.registerTool("joongna_search_keyword", { description: "Return Joongna listings, including sold-out items, descriptions, and product images. Descriptions and images cost one upstream request per listing and can partially fail; detail_failures in the result counts the listings that came back without them.", inputSchema: z.object({
-              query: z.string().describe("Product name to search for on Joongna"),
-              search_word: z
-                .string()
-                .optional()
-                .describe("Optional explicit Joongna search term override, ideally in Korean"),
-              max_listings: z
-                .number()
-                .int()
-                .min(1)
-                .max(100)
-                .default(20)
-                .describe("Maximum listings to return"),
-            }), outputSchema: SearchKeywordResultSchema }, async ({ query, search_word, max_listings }) => {
-              const result = await searchKeyword(config, { query, searchWord: search_word, maxListings: max_listings });
-              return toolResult(result);
-            });
-
+  server.registerTool(
+    "joongna_search_keyword",
+    {
+      description:
+        "Search one native Joongna page. Defaults to 50 native results, details enabled, and no seller evidence. The cursor is opaque; no automatic page fill or offset pagination is performed.",
+      inputSchema: SearchInputSchema,
+      outputSchema: SearchOutputSchema,
+    },
+    async (args) => {
+      const result = await searchListings(env, args);
+      return toolResult(result, result.outcome === "error");
+    },
+  );
+  server.registerTool(
+    "joongna_search_price",
+    {
+      description:
+        "Return the Joongna sales-price source chart for 30, 90, or 180 days, with related current listings. Chart population, weighting, and exact transaction semantics are unknown.",
+      inputSchema: ChartInputSchema,
+      outputSchema: ChartOutputSchema,
+    },
+    async (args) => {
+      const result = await searchPrice(env, args);
+      return toolResult(result, result.outcome === "error");
+    },
+  );
+  server.registerTool(
+    "joongna_get_seller_evidence",
+    {
+      description:
+        "Fetch Joongna safeTradeCount and reviewCount evidence for each requested seller ID.",
+      inputSchema: SellerBatchSchema,
+      outputSchema: SellerOutputSchema,
+    },
+    async ({ seller_ids }) => {
+      const config = configFrom(env);
+      const unique = [...new Set(seller_ids)];
+      const values = await fetchSellerBatch(config, unique);
+      const sellers = seller_ids.map((id) => values.get(id)!);
+      return toolResult({
+        outcome: sellers.some((seller) => seller.status !== "available")
+          ? "partial"
+          : "ok",
+        sellers,
+      });
+    },
+  );
   return server;
 }
-
-// --- entry -------------------------------------------------------------------
-
-/**
- * No identity headers, so no service.
- *
- * The only way to reach this Worker is through a service binding declared by
- * another Worker in the account, and the only Worker that declares one is the
- * gateway, which never forwards a request it has not authorized. So arriving
- * here without an identity means the deployment is wrong -- the gateway's
- * route for this host lost its `mcp` policy, or something else in the account
- * bound to this Worker directly.
- *
- * 500 rather than 401, because it is true. A 401 would tell the caller to
- * authenticate, and the caller may well have done so correctly; the fault is
- * on this side of the binding. Serving the tools anyway is the specific
- * failure the whole gateway arrangement exists to prevent, so this refuses.
- */
 function refused(): Response {
   return Response.json(
-    { error: "no gateway identity", detail: "this service is only reachable through the gateway" },
+    {
+      error: "no gateway identity",
+      detail: "this service is only reachable through the gateway",
+    },
     { status: 500 },
   );
 }
-
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    // Before routing, not after. There is no path here that serves without an
-    // identity, so there is no reason for one to be reachable before the check.
     if (identityFrom(request.headers) === null) return refused();
-
-    const url = new URL(request.url);
-
-    // Only /mcp. /healthz and /.well-known/oauth-protected-resource are the
-    // gateway's now (which is why healthz changed shape: `ok` as text/plain
-    // rather than `{"ok":true}` as JSON), and `/` never arrives here because
-    // the gateway does not route it.
-    //
-    // `/mcp/*` as well as `/mcp`, which this service accepted before the
-    // cutover and keeps accepting. The gateway's route for this host has no
-    // path_prefix, so both arrive here.
-    if (url.pathname !== "/mcp" && !url.pathname.startsWith("/mcp/")) {
+    const path = new URL(request.url).pathname;
+    if (path !== "/mcp" && !path.startsWith("/mcp/"))
       return new Response("not found", { status: 404 });
-    }
-
-    // Dual-era MCP: createMcpHandler serves 2026-07-28 (stateless, per-request)
-    // and legacy 2025-era clients through the stateless handshake fallback.
-    // A fresh handler per request closes over env; each McpServer instance the
-    // factory builds is itself per-request.
-    //
-    // CORS is the gateway's now: under the `mcp` policy it strips
-    // access-control-allow-origin and -expose-headers from whatever the
-    // backend returns and sets its own (gateway src/responseRewrite.ts).
     return createMcpHandler(() => buildServer(env)).fetch(request);
   },
 };
