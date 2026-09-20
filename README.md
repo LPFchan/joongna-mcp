@@ -43,6 +43,10 @@ It holds no state: no D1, KV, or R2. Every tool call fetches Joongna fresh.
   — full search listings, including sold-out items.
   `max_listings`: 1–100, default 20.
 
+Both tools advertise their complete output schema through MCP and return the
+result as `structuredContent`. The same JSON is also present in text content
+for clients that do not consume structured tool results.
+
 `query` is normalized into a Joongna search word (English device names are
 translated, English filler is stripped, spaces are removed); pass
 `search_word` to use an exact term instead. There is no cache; every call

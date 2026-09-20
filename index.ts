@@ -245,77 +245,92 @@ const SUMMARY_RE = />(평균 가격|가장 높은 가격|가장 낮은 가격)<\
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 type JsonObject = { [key: string]: JsonValue };
 
-interface PriceSummaryData {
-  average_price_krw: number | null;
-  highest_price_krw: number | null;
-  lowest_price_krw: number | null;
-}
+const nullableInteger = z.number().int().nullable();
 
-interface SearchMetadataData {
-  search_keyword: string | null;
-  selected_exposure_keyword: string | null;
-  selected_model_name: string | null;
-  selected_option_name: string | null;
-}
+const PriceSummarySchema = z.object({
+  average_price_krw: nullableInteger,
+  highest_price_krw: nullableInteger,
+  lowest_price_krw: nullableInteger,
+});
 
-interface ListingData {
-  sequence: number;
-  title: string;
-  price_krw: number;
-  listing_url: string;
-  thumbnail_url: string | null;
-  description: string | null;
-  image_urls: string[];
-  sorted_at: string | null;
-  location_name: string | null;
-  parcel_fee_krw: number | null;
-  chat_count: number | null;
-  wish_count: number | null;
-  pickup_badge: boolean | null;
-  certified_seller: boolean | null;
-  sale_status: SaleStatus | null;
-}
+const SearchMetadataSchema = z.object({
+  search_keyword: z.string().nullable(),
+  selected_exposure_keyword: z.string().nullable(),
+  selected_model_name: z.string().nullable(),
+  selected_option_name: z.string().nullable(),
+});
 
-interface PriceHistoryDatasetData {
-  source_key: "BID" | "EXECUTION";
-  label_ko: "등록가" | "판매가";
-  listing_count: number;
-  daily_average_prices: Array<{ date: string; average_price_krw: number }>;
-  hourly_scatter_points: Array<{ date_hour: string; price_krw: number; count: number }>;
-  listings: ListingData[];
-}
+const SaleStatusSchema = z.union([
+  z.enum(["on_sale", "reserved", "sold"]),
+  z.string().regex(/^unknown_-?\d+$/),
+]);
 
-/**
- * Listings whose product-detail request failed and so carry only search-page
- * fields (description null, thumbnail only). Detail fetches are one
- * subrequest per unique listing, all in flight at once, so a Joongna
- * hiccup or a platform subrequest cap shows up here rather than as a failed
- * search.
- */
-type DetailFailures = { detail_failures: number };
+const ListingSchema = z.object({
+  sequence: z.number().int(),
+  title: z.string(),
+  price_krw: z.number().int(),
+  listing_url: z.string(),
+  thumbnail_url: z.string().nullable(),
+  description: z.string().nullable(),
+  image_urls: z.array(z.string()),
+  sorted_at: z.string().nullable(),
+  location_name: z.string().nullable(),
+  parcel_fee_krw: nullableInteger,
+  chat_count: nullableInteger,
+  wish_count: nullableInteger,
+  pickup_badge: z.boolean().nullable(),
+  certified_seller: z.boolean().nullable(),
+  sale_status: SaleStatusSchema.nullable(),
+});
 
-interface SearchPriceResult extends DetailFailures {
-  query: string;
-  search_word: string;
-  source_url: string;
-  fetched_at: string;
-  empty_result: boolean;
-  empty_result_reason: string | null;
-  summary: PriceSummaryData;
-  metadata: SearchMetadataData | null;
-  registered_price_history: PriceHistoryDatasetData | null;
-  sold_price_history: PriceHistoryDatasetData | null;
-  available_listings: ListingData[];
-}
+const PriceHistoryDatasetSchema = z.object({
+  source_key: z.enum(["BID", "EXECUTION"]),
+  label_ko: z.enum(["등록가", "판매가"]),
+  listing_count: z.number().int(),
+  daily_average_prices: z.array(z.object({
+    date: z.string(),
+    average_price_krw: z.number().int(),
+  })),
+  hourly_scatter_points: z.array(z.object({
+    date_hour: z.string(),
+    price_krw: z.number().int(),
+    count: z.number().int(),
+  })),
+  listings: z.array(ListingSchema),
+});
 
-interface SearchKeywordResult extends DetailFailures {
-  query: string;
-  search_word: string;
-  source_url: string;
-  fetched_at: string;
-  total_count: number;
-  listings: ListingData[];
-}
+const SearchPriceResultSchema = z.object({
+  query: z.string(),
+  search_word: z.string(),
+  source_url: z.string(),
+  fetched_at: z.string(),
+  detail_failures: z.number().int().nonnegative(),
+  empty_result: z.boolean(),
+  empty_result_reason: z.string().nullable(),
+  summary: PriceSummarySchema,
+  metadata: SearchMetadataSchema.nullable(),
+  registered_price_history: PriceHistoryDatasetSchema.nullable(),
+  sold_price_history: PriceHistoryDatasetSchema.nullable(),
+  available_listings: z.array(ListingSchema),
+});
+
+const SearchKeywordResultSchema = z.object({
+  query: z.string(),
+  search_word: z.string(),
+  source_url: z.string(),
+  fetched_at: z.string(),
+  detail_failures: z.number().int().nonnegative(),
+  total_count: z.number().int().nonnegative(),
+  listings: z.array(ListingSchema),
+});
+
+type PriceSummaryData = z.infer<typeof PriceSummarySchema>;
+type SearchMetadataData = z.infer<typeof SearchMetadataSchema>;
+type SaleStatus = z.infer<typeof SaleStatusSchema>;
+type ListingData = z.infer<typeof ListingSchema>;
+type PriceHistoryDatasetData = z.infer<typeof PriceHistoryDatasetSchema>;
+type SearchPriceResult = z.infer<typeof SearchPriceResultSchema>;
+type SearchKeywordResult = z.infer<typeof SearchKeywordResultSchema>;
 
 // Minimal HTML entity unescape for the entities that actually appear in
 // Next.js flight payloads (HTML-escaped titles).
@@ -457,7 +472,8 @@ function strOrNull(value: JsonValue | undefined): string | null {
 
 function intOrNull(value: JsonValue | undefined): number | null {
   if (value === undefined || value === null) return null;
-  return Number.parseInt(String(value), 10);
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isNaN(parsed) ? null : parsed;
 }
 
 function boolOrNull(value: JsonValue | undefined): boolean | null {
@@ -487,7 +503,6 @@ function buildMetadata(data: JsonObject): SearchMetadataData | null {
 // Joongna's listing payloads carry sale state as a bare integer. Verified
 // against product pages: 0 shows no badge, 1 shows 예약중, 3 shows 판매완료.
 // Unrecognized codes keep their number so they stay debuggable.
-type SaleStatus = "on_sale" | "reserved" | "sold" | `unknown_${number}`;
 
 export function saleStatusFromState(state: number | null): SaleStatus | null {
   if (state === null) return null;
@@ -498,7 +513,7 @@ export function saleStatusFromState(state: number | null): SaleStatus | null {
 }
 
 function buildListing(item: JsonObject): ListingData {
-  const sequence = Number.parseInt(String(item["seq"]), 10);
+  const sequence = intOrNull(item["seq"]) as number;
   const articleUrl = item["articleUrl"];
   let listingUrl: string;
   if (typeof articleUrl === "string" && articleUrl) {
@@ -509,7 +524,7 @@ function buildListing(item: JsonObject): ListingData {
     listingUrl = "https://web.joongna.com/product/" + sequence;
   }
 
-  const thumbnailUrl = (item["url"] as string | null | undefined) || null;
+  const thumbnailUrl = typeof item["url"] === "string" && item["url"] ? item["url"] : null;
 
   return {
     sequence,
@@ -548,10 +563,13 @@ function flattenScatterPoints(
       const price = priceCount["price"];
       const count = priceCount["count"];
       if (price === null || price === undefined || count === null || count === undefined) continue;
+      const parsedPrice = intOrNull(price);
+      const parsedCount = intOrNull(count);
+      if (parsedPrice === null || parsedCount === null) continue;
       points.push({
         date_hour: String(dateHour),
-        price_krw: Number.parseInt(String(price), 10),
-        count: Number.parseInt(String(count), 10),
+        price_krw: parsedPrice,
+        count: parsedCount,
       });
     }
   }
@@ -569,9 +587,11 @@ function buildHistoryDataset(sourceKey: "BID" | "EXECUTION", data: JsonObject): 
       if (!isObject(point)) continue;
       if (point["date"] === null || point["date"] === undefined) continue;
       if (point["avgPrice"] === null || point["avgPrice"] === undefined) continue;
+      const averagePrice = intOrNull(point["avgPrice"]);
+      if (averagePrice === null) continue;
       dailyAveragePrices.push({
         date: String(point["date"]),
-        average_price_krw: Number.parseInt(String(point["avgPrice"]), 10),
+        average_price_krw: averagePrice,
       });
     }
   }
@@ -582,9 +602,9 @@ function buildHistoryDataset(sourceKey: "BID" | "EXECUTION", data: JsonObject): 
     listing_count: items.length,
     daily_average_prices: dailyAveragePrices,
     hourly_scatter_points: flattenScatterPoints(productPrice["scatterPrices"] ?? []),
-    listings: items.filter(
-      (item): item is JsonObject => isObject(item) && item["seq"] !== null && item["seq"] !== undefined,
-    ).map(buildListing),
+    listings: items
+      .filter((item): item is JsonObject => isObject(item) && intOrNull(item["seq"]) !== null)
+      .map(buildListing),
   };
 }
 
@@ -669,7 +689,7 @@ export function parseSearchKeywordPage(
 ): SearchKeywordResult {
   const items = iterSearchItems(html);
   const listings = items
-    .filter((item) => item["seq"] !== null && item["seq"] !== undefined)
+    .filter((item) => intOrNull(item["seq"]) !== null)
     .map(buildListing);
 
   return {
@@ -821,9 +841,13 @@ async function searchKeyword(
 
 // --- MCP server --------------------------------------------------------------
 
-function text(value: unknown): { content: Array<{ type: "text"; text: string }> } {
+function toolResult<T extends object>(value: T): {
+  content: Array<{ type: "text"; text: string }>;
+  structuredContent: Record<string, unknown>;
+} {
   return {
-    content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
+    content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
+    structuredContent: value as Record<string, unknown>,
   };
 }
 
@@ -856,9 +880,9 @@ function buildServer(env: Env): McpServer {
                 .max(20)
                 .default(10)
                 .describe("Maximum listings to return per dataset"),
-            }) }, async ({ query, search_word, max_listings }) => {
+            }), outputSchema: SearchPriceResultSchema }, async ({ query, search_word, max_listings }) => {
               const result = await searchPrice(config, { query, searchWord: search_word, maxListings: max_listings });
-              return text(result);
+              return toolResult(result);
             });
 
   server.registerTool("joongna_search_keyword", { description: "Return Joongna listings, including sold-out items, descriptions, and product images. Descriptions and images cost one upstream request per listing and can partially fail; detail_failures in the result counts the listings that came back without them.", inputSchema: z.object({
@@ -874,9 +898,9 @@ function buildServer(env: Env): McpServer {
                 .max(100)
                 .default(20)
                 .describe("Maximum listings to return"),
-            }) }, async ({ query, search_word, max_listings }) => {
+            }), outputSchema: SearchKeywordResultSchema }, async ({ query, search_word, max_listings }) => {
               const result = await searchKeyword(config, { query, searchWord: search_word, maxListings: max_listings });
-              return text(result);
+              return toolResult(result);
             });
 
   return server;

@@ -71,7 +71,8 @@ describe("parseSearchKeywordPage", () => {
           mainLocationName: "",
           articleUrl: "/product/230894836",
         },
-        { seq: 1, price: null, url: null, title: null },
+        { seq: 1, price: null, url: 42, title: null, state: "garbage", parcelFee: "garbage" },
+        { seq: "garbage", price: 100, title: "invalid listing" },
       ],
     });
     const result = parseSearchKeywordPage(html, {
@@ -89,7 +90,14 @@ describe("parseSearchKeywordPage", () => {
     // The Python built these with `or None`, so an empty string is a null.
     expect(first.sorted_at).toBeNull();
     expect(first.location_name).toBeNull();
-    expect(second).toMatchObject({ title: "", price_krw: 0, thumbnail_url: null, image_urls: [], sale_status: null });
+    expect(second).toMatchObject({
+      title: "",
+      price_krw: 0,
+      thumbnail_url: null,
+      image_urls: [],
+      parcel_fee_krw: null,
+      sale_status: null,
+    });
   });
 
   it("returns no listings when the page carries no items", () => {
@@ -116,9 +124,15 @@ describe("parseSearchPricePage", () => {
             selectOptionName: "",
             emptyResult: null,
             productPrice: {
-              linePrices: [{ date: "2026-04-15", avgPrice: 285000 }],
+              linePrices: [
+                { date: "2026-04-15", avgPrice: 285000 },
+                { date: "2026-04-16", avgPrice: "garbage" },
+              ],
               scatterPrices: [
-                { dateHour: "2026-04-15 01:00:00", priceCounts: [{ price: 280000, count: 1 }] },
+                {
+                  dateHour: "2026-04-15 01:00:00",
+                  priceCounts: [{ price: 280000, count: 1 }, { price: "garbage", count: 1 }],
+                },
               ],
             },
             items: [
@@ -199,6 +213,8 @@ describe("parseSearchPricePage", () => {
 
     expect(result.registered_price_history?.label_ko).toBe("등록가");
     expect(result.registered_price_history?.daily_average_prices[0].average_price_krw).toBe(285000);
+    expect(result.registered_price_history?.daily_average_prices).toHaveLength(1);
+    expect(result.registered_price_history?.hourly_scatter_points).toHaveLength(1);
 
     expect(result.sold_price_history?.label_ko).toBe("판매가");
     expect(result.sold_price_history?.daily_average_prices[0].average_price_krw).toBe(260000);

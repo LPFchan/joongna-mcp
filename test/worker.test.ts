@@ -164,6 +164,13 @@ describe("MCP handshake", () => {
     expect(price.force_refresh).toBeUndefined(); // the cache it bypassed went with the Python
     const keyword = json.result.tools[1].inputSchema.properties;
     expect(keyword.max_listings).toMatchObject({ minimum: 1, maximum: 100, default: 20 });
+
+    const priceOutput = json.result.tools[0].outputSchema.properties;
+    expect(priceOutput.available_listings.items.properties.sale_status).toBeDefined();
+    expect(priceOutput.available_listings.items.properties.state).toBeUndefined();
+    const keywordOutput = json.result.tools[1].outputSchema.properties;
+    expect(keywordOutput.listings.items.properties.sale_status).toBeDefined();
+    expect(keywordOutput.listings.items.properties.state).toBeUndefined();
   });
 
   it("answers server/discover for a 2026-07-28 client with a five-minute cache hint", async () => {
@@ -260,12 +267,14 @@ describe("tool calls", () => {
     expect(keywordResult.listings[0].description).toBe("판매자가 작성한 상품 설명");
     expect(keywordResult.listings[0].image_urls).toEqual(expectedImages);
     expect(keywordResult.listings[0].sale_status).toBe("on_sale");
+    expect(keyword.json.result.structuredContent).toEqual(keywordResult);
 
     const price = await callTool("joongna_search_price", { query: "아이폰13미니" });
     const priceResult = JSON.parse(price.json.result.content[0].text);
     expect(priceResult.available_listings[0].description).toBe("판매자가 작성한 상품 설명");
     expect(priceResult.available_listings[0].image_urls).toEqual(expectedImages);
     expect(priceResult.registered_price_history.listings[0].description).toBe("판매자가 작성한 상품 설명");
+    expect(price.json.result.structuredContent).toEqual(priceResult);
 
     // One detail fetch per unique listing per call, even though the price
     // result carries the same listing in two places.
