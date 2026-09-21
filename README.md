@@ -23,8 +23,8 @@ npm run typecheck
 npm run deploy
 ```
 
-`npm run deploy` obtains `CLOUDFLARE_API_TOKEN` through the repository's
-`passage` setup. The Worker configuration only contains upstream URL,
+`npm run deploy` needs `CLOUDFLARE_API_TOKEN` in the environment; on the deploy
+host it is exported from `~/.zshenv`. The Worker configuration only contains upstream URL,
 timeout, and user-agent variables.
 
 ## Tools
