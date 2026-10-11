@@ -285,47 +285,6 @@ const SearchOutputSchema = z
   .meta({ type: "object" });
 type Listing = z.infer<typeof ListingSchema>;
 export type SearchListingsResponse = z.infer<typeof SearchOutputSchema>;
-const ChartSchema = z.object({
-  source: z.literal("joongna"),
-  source_label: z.enum(["registered_price", "sales_price"]),
-  requested_range: z.object({
-    date_range: z.union([z.literal(30), z.literal(90), z.literal(180)]),
-  }),
-  observed_range: z.object({
-    date_from: z.string().nullable(),
-    date_to: z.string().nullable(),
-    inclusive_day_count: z.number().int().nullable(),
-  }),
-  completeness: z.enum(["unknown", "partial", "complete"]),
-  weighting_semantics: z.literal("unknown"),
-  population_semantics: z.literal("unknown"),
-  line_prices: z.array(z.record(z.string(), z.unknown())),
-  scatter_prices: z.array(z.record(z.string(), z.unknown())),
-  native_scatter_price_count_avg: z.unknown().nullable(),
-  related_current_listings: z.array(ListingSchema),
-  native_related_listing_count: z.number().int().nonnegative(),
-});
-const ChartDataSchema = z.object({
-  page_observed_at: z.string(),
-  search_word: z.string(),
-  chart: ChartSchema,
-  pagination: PaginationSchema,
-  warnings: z.array(z.object({ code: z.string(), message: z.string() })),
-});
-const ChartOutputSchema = z
-  .discriminatedUnion("outcome", [
-    ChartDataSchema.extend({ outcome: z.literal("ok") }),
-    ChartDataSchema.extend({ outcome: z.literal("partial") }),
-    z.object({
-      outcome: z.literal("error"),
-      search_word: z.string().optional(),
-      error: ErrorSchema,
-      request_cursor: z.null(),
-      pagination: ErrorPaginationSchema,
-    }),
-  ])
-  .meta({ type: "object" });
-
 export interface SearchInput {
   query?: string;
   search_word?: string;
@@ -1153,204 +1112,6 @@ export async function searchListings(
   }
 }
 
-async function fetchChart(
-  config: ReturnType<typeof configFrom>,
-  searchWord: string,
-  dateRange: 30 | 90 | 180,
-  sourceLabel: "registered_price" | "sales_price",
-): Promise<JsonRecord> {
-  const root = record(
-    await fetchJson(
-      config,
-      `${config.searchApi}/v4/analysis/product-price/scatter-plot`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          searchWord,
-          priceType: sourceLabel === "registered_price" ? 0 : 1,
-          productPriceSize: 1,
-          dateRange,
-        }),
-      },
-    ),
-  );
-  validateNativeEnvelope(root, "Joongna chart");
-  const data = record(root.data);
-  return Object.keys(data).length ? data : root;
-}
-function chartFromPayload(
-  data: JsonRecord,
-  config: ReturnType<typeof configFrom>,
-  observedAt: string,
-  requestedRange: 30 | 90 | 180,
-  maxRelated: number,
-  sourceLabel: "registered_price" | "sales_price",
-): z.infer<typeof ChartSchema> {
-  if (
-    !data.productPrice ||
-    typeof data.productPrice !== "object" ||
-    Array.isArray(data.productPrice)
-  )
-    throw new DomainError(
-      "parse_failed",
-      false,
-      undefined,
-      "Joongna chart response did not contain productPrice",
-    );
-  const productPrice = record(data.productPrice);
-  if (
-    !Array.isArray(productPrice.linePrices) ||
-    !Array.isArray(productPrice.scatterPrices)
-  )
-    throw new DomainError(
-      "parse_failed",
-      false,
-      undefined,
-      "Joongna chart response did not contain price series",
-    );
-  if (
-    productPrice.linePrices.some(
-      (x) => typeof x !== "object" || x === null || Array.isArray(x),
-    ) ||
-    productPrice.scatterPrices.some(
-      (x) => typeof x !== "object" || x === null || Array.isArray(x),
-    )
-  )
-    throw new DomainError(
-      "parse_failed",
-      false,
-      undefined,
-      "Joongna chart response contained malformed series data",
-    );
-  const line = productPrice.linePrices as JsonRecord[];
-  const scatter = productPrice.scatterPrices as JsonRecord[];
-  const dates = [
-    ...line.map((x) => stringOrNull(x.date)),
-    ...scatter.map((x) => stringOrNull(x.dateHour)?.slice(0, 10)),
-  ]
-    .filter(
-      (x): x is string =>
-        typeof x === "string" &&
-        /^\d{4}-\d{2}-\d{2}$/.test(x) &&
-        Number.isFinite(Date.parse(`${x}T00:00:00Z`)),
-    )
-    .sort();
-  if (
-    data.items !== undefined &&
-    (!Array.isArray(data.items) ||
-      data.items.some(
-        (x) => typeof x !== "object" || x === null || Array.isArray(x),
-      ))
-  )
-    throw new DomainError(
-      "parse_failed",
-      false,
-      undefined,
-      "Joongna chart response contained malformed related listings",
-    );
-  const items = (data.items ?? []) as JsonRecord[];
-  return {
-    source: "joongna",
-    source_label: sourceLabel,
-    requested_range: {
-      date_range: requestedRange,
-    },
-    observed_range: {
-      date_from: dates[0] ?? null,
-      date_to: dates.at(-1) ?? null,
-      inclusive_day_count: dates.length
-        ? Math.round(
-            (Date.parse(`${dates.at(-1)}T00:00:00Z`) -
-              Date.parse(`${dates[0]}T00:00:00Z`)) /
-              86400000,
-          ) + 1
-        : null,
-    },
-    completeness: "unknown",
-    weighting_semantics: "unknown",
-    population_semantics: "unknown",
-    line_prices: line,
-    scatter_prices: scatter,
-    native_scatter_price_count_avg: productPrice.scatterPriceCountAvg ?? null,
-    related_current_listings: items
-      .slice(0, maxRelated)
-      .map((item) => listingFromItem(item, config, observedAt)),
-    native_related_listing_count: items.length,
-  };
-}
-const ChartInputSchema = z
-  .object({
-    query: z.string().optional(),
-    search_word: z.string().optional(),
-    date_range: z
-      .union([z.literal(30), z.literal(90), z.literal(180)])
-      .default(30),
-    source_label: z
-      .enum(["registered_price", "sales_price"])
-      .default("sales_price"),
-    max_related_listings: z.number().int().min(1).max(50).default(20),
-    include_details: z.boolean().default(true),
-  })
-  .strict();
-async function searchPrice(
-  env: Env,
-  input: z.infer<typeof ChartInputSchema>,
-): Promise<z.infer<typeof ChartOutputSchema>> {
-  const config = configFrom(env);
-  let searchWord = "";
-  try {
-    searchWord = effectiveSearchWord(input);
-    const observed = isoNow();
-    const chart = chartFromPayload(
-      await fetchChart(
-        config,
-        searchWord,
-        input.date_range,
-        input.source_label,
-      ),
-      config,
-      observed,
-      input.date_range,
-      input.max_related_listings,
-      input.source_label,
-    );
-    let partial = false;
-    if (input.include_details && chart.related_current_listings.length)
-      partial = await enrichDetails(config, chart.related_current_listings);
-    return {
-      outcome: partial ? "partial" : "ok",
-      page_observed_at: observed,
-      search_word: searchWord,
-      chart,
-      pagination: {
-        native_page_size: chart.native_related_listing_count,
-        raw_count: chart.native_related_listing_count,
-        next_cursor: null,
-        has_more: false,
-        total_count: { value: null, kind: "unavailable" },
-      },
-      warnings: [
-        {
-          code: "source_chart_limits",
-          message:
-            "This is a Joongna source chart with unknown population and weighting; it is not an exact transaction average.",
-        },
-      ],
-    };
-  } catch (error) {
-    const e =
-      error instanceof DomainError
-        ? error
-        : new DomainError("parse_failed", false);
-    return {
-      outcome: "error",
-      search_word: searchWord || undefined,
-      error: { code: e.code, retryable: e.retryable, message: e.message },
-      request_cursor: null,
-      pagination: { next_cursor: null, has_more: null },
-    } as z.infer<typeof ChartOutputSchema>;
-  }
-}
 function toolResult(value: object, isError = false) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }],
@@ -1360,7 +1121,7 @@ function toolResult(value: object, isError = false) {
 }
 function buildServer(env: Env): McpServer {
   const server = new McpServer(
-    { name: "joongna-mcp", version: "0.2.0" },
+    { name: "joongna-mcp", version: "0.3.0" },
     {
       cacheHints: {
         "tools/list": { ttlMs: 300_000, cacheScope: "private" },
@@ -1369,7 +1130,7 @@ function buildServer(env: Env): McpServer {
     },
   );
   server.registerTool(
-    "joongna_search_keyword",
+    "joongna_search",
     {
       description:
         "Search one native Joongna page. Defaults to 50 native results, details enabled, and no seller evidence. The cursor is opaque; no automatic page fill or offset pagination is performed.",
@@ -1378,19 +1139,6 @@ function buildServer(env: Env): McpServer {
     },
     async (args) => {
       const result = await searchListings(env, args);
-      return toolResult(result, result.outcome === "error");
-    },
-  );
-  server.registerTool(
-    "joongna_search_price",
-    {
-      description:
-        "Return the Joongna sales-price source chart for 30, 90, or 180 days, with related current listings. Chart population, weighting, and exact transaction semantics are unknown.",
-      inputSchema: ChartInputSchema,
-      outputSchema: ChartOutputSchema,
-    },
-    async (args) => {
-      const result = await searchPrice(env, args);
       return toolResult(result, result.outcome === "error");
     },
   );
