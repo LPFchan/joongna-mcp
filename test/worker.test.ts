@@ -158,7 +158,7 @@ describe("MCP contract", () => {
       expect(json.result.protocolVersion).toBe(protocolVersion);
       expect(json.result.serverInfo).toEqual({
         name: "joongna-mcp",
-        version: "0.2.0",
+        version: "0.3.0",
       });
     },
   );
@@ -174,7 +174,7 @@ describe("MCP contract", () => {
       ttlMs: 300_000,
       cacheScope: "private",
     });
-    expect(listed.json.result.tools).toHaveLength(3);
+    expect(listed.json.result.tools).toHaveLength(2);
   });
 
   it("executes a modern structured tool call", async () => {
@@ -183,7 +183,7 @@ describe("MCP contract", () => {
       vi.fn(async () => responseFor([])),
     );
     const result = await rpc2026("tools/call", {
-      name: "joongna_search_keyword",
+      name: "joongna_search",
       arguments: { search_word: "아이폰", include_details: false },
     });
     expect(result.status).toBe(200);
@@ -202,8 +202,7 @@ describe("MCP contract", () => {
     expect(
       json.result.tools.map((tool: { name: string }) => tool.name),
     ).toEqual([
-      "joongna_search_keyword",
-      "joongna_search_price",
+      "joongna_search",
       "joongna_get_seller_evidence",
     ]);
     const search = json.result.tools[0];
@@ -216,9 +215,6 @@ describe("MCP contract", () => {
           variant.properties.outcome.const,
       ),
     ).toEqual(["ok", "partial", "error"]);
-    expect(json.result.tools[1].inputSchema.properties.date_range.default).toBe(
-      30,
-    );
   });
 
   it("passes native price/status/sort filters, excludes external ads, and preserves invalid prices as null", async () => {
@@ -251,7 +247,7 @@ describe("MCP contract", () => {
         id: 2,
         method: "tools/call",
         params: {
-          name: "joongna_search_keyword",
+          name: "joongna_search",
           arguments: {
             search_word: "아이폰 17",
             min_price_krw: 150000,
@@ -311,7 +307,7 @@ describe("MCP contract", () => {
         throw new Error(`unexpected URL ${url}`);
       }),
     );
-    const { json } = await callTool("joongna_search_keyword", {
+    const { json } = await callTool("joongna_search", {
       search_word: "아이폰",
       include_seller_evidence: true,
     });
@@ -339,7 +335,7 @@ describe("MCP contract", () => {
       { "mcp-protocol-version": "2025-06-18" },
     );
     const schema = listed.json.result.tools.find(
-      (tool: { name: string }) => tool.name === "joongna_search_keyword",
+      (tool: { name: string }) => tool.name === "joongna_search",
     ).outputSchema;
     expect(new Ajv2020({ strict: false }).compile(schema)(data)).toBe(true);
   });
@@ -429,7 +425,7 @@ describe("MCP contract", () => {
         id: 3,
         method: "tools/call",
         params: {
-          name: "joongna_search_keyword",
+          name: "joongna_search",
           arguments: { search_word: "아이폰 17", include_details: false },
         },
       },
@@ -443,7 +439,7 @@ describe("MCP contract", () => {
         id: 4,
         method: "tools/call",
         params: {
-          name: "joongna_search_keyword",
+          name: "joongna_search",
           arguments: {
             search_word: "아이폰 17",
             cursor,
@@ -472,7 +468,7 @@ describe("MCP contract", () => {
         id: 5,
         method: "tools/call",
         params: {
-          name: "joongna_search_keyword",
+          name: "joongna_search",
           arguments: {
             search_word: "아이폰",
             cursor: null,
@@ -495,7 +491,7 @@ describe("MCP contract", () => {
       { "mcp-protocol-version": "2025-06-18" },
     );
     const schema = listed.json.result.tools.find(
-      (tool: { name: string }) => tool.name === "joongna_search_keyword",
+      (tool: { name: string }) => tool.name === "joongna_search",
     ).outputSchema;
     expect(ajv.compile(schema)(malformed.json.result.structuredContent)).toBe(
       true,
@@ -510,7 +506,7 @@ describe("MCP contract", () => {
         id: 9,
         method: "tools/call",
         params: {
-          name: "joongna_search_keyword",
+          name: "joongna_search",
           arguments: { search_word: "아이폰", include_details: false },
         },
       },
@@ -534,7 +530,7 @@ describe("MCP contract", () => {
         id: 6,
         method: "tools/call",
         params: {
-          name: "joongna_search_keyword",
+          name: "joongna_search",
           arguments: { search_word: "아이폰", cursor, include_details: false },
         },
       },
@@ -555,7 +551,7 @@ describe("MCP contract", () => {
       "fetch",
       vi.fn(async () => new Response("forbidden", { status: 403 })),
     );
-    const forbidden = await callTool("joongna_search_keyword", {
+    const forbidden = await callTool("joongna_search", {
       search_word: "아이폰",
       include_details: false,
     });
@@ -579,7 +575,7 @@ describe("MCP contract", () => {
       "fetch",
       vi.fn(async () => abortedResponse),
     );
-    const aborted = await callTool("joongna_search_keyword", {
+    const aborted = await callTool("joongna_search", {
       search_word: "아이폰",
       include_details: false,
     });
@@ -601,7 +597,7 @@ describe("MCP contract", () => {
           }),
       ),
     );
-    const zeroRetryAfter = await callTool("joongna_search_keyword", {
+    const zeroRetryAfter = await callTool("joongna_search", {
       search_word: "아이폰",
       include_details: false,
     });
@@ -610,57 +606,5 @@ describe("MCP contract", () => {
       retryable: true,
       retry_after_seconds: 0,
     });
-  });
-
-  it("requests numeric 90-day registered chart data without inventing averages", async () => {
-    let requestBody: JsonRecord | undefined;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const request = new Request(input, init);
-        requestBody = JSON.parse(await request.clone().text());
-        return Response.json({
-          data: {
-            productPrice: {
-              linePrices: [{ date: "2026-06-22", avgPrice: 1200000 }],
-              scatterPrices: [],
-              scatterPriceCountAvg: 1,
-            },
-            items: [],
-          },
-        });
-      }),
-    );
-    const { json } = await rpc(
-      {
-        jsonrpc: "2.0",
-        id: 7,
-        method: "tools/call",
-        params: {
-          name: "joongna_search_price",
-          arguments: {
-            search_word: "아이폰 17",
-            date_range: 90,
-            source_label: "registered_price",
-            include_details: false,
-          },
-        },
-      },
-      { "mcp-protocol-version": "2025-06-18" },
-    );
-    expect(requestBody).toMatchObject({
-      searchWord: "아이폰 17",
-      dateRange: 90,
-      priceType: 0,
-    });
-    expect(json.result.structuredContent.chart.requested_range.date_range).toBe(
-      90,
-    );
-    expect(
-      json.result.structuredContent.chart.native_scatter_price_count_avg,
-    ).toBe(1);
-    expect(
-      json.result.structuredContent.chart.source_reported_scatter_average_krw,
-    ).toBeUndefined();
   });
 });

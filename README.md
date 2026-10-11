@@ -1,7 +1,7 @@
 # Joongna MCP
 
-This Cloudflare Worker exposes Joongna search, source price-chart, and seller
-evidence data through MCP. The public contract is version `0.2.0`.
+This Cloudflare Worker exposes Joongna search and seller evidence data through
+MCP. The public contract is version `0.3.0`.
 
 ## Gateway and deployment
 
@@ -29,7 +29,7 @@ timeout, and user-agent variables.
 
 ## Tools
 
-### `joongna_search_keyword`
+### `joongna_search`
 
 Searches exactly one native Joongna search page. Supply `query`, or supply an
 exact `search_word`; at least one is required. A nonblank `search_word` is sent
@@ -92,32 +92,6 @@ fails. Duplicate detail and seller requests are deduplicated, and seller batch
 work is bounded. Evidence is source data, not a safety or qualification
 judgment.
 
-### `joongna_search_price`
-
-Returns the native Joongna product-price chart and separate related current
-listings. `date_range` accepts numeric `30`, `90`, or `180` days and defaults to
-`30`. `source_label` defaults to `sales_price`; `registered_price` is also
-supported. `max_related_listings` defaults to 20 and limits only the related
-current listings. Details default to `true` for those listings.
-
-```json
-{
-  "search_word": "닌텐도 스위치",
-  "date_range": 90,
-  "source_label": "registered_price",
-  "max_related_listings": 10,
-  "include_details": true
-}
-```
-
-The chart returns raw line and scatter series, observed valid date bounds, the
-requested range, and the native `scatterPriceCountAvg` value under the
-source-named field `native_scatter_price_count_avg`. Its units and meaning are
-unverified, so it is not presented as an average paid price or transaction
-count. Chart population, weighting, completeness, and exact transaction
-semantics are unknown. This tool does not provide exact sold averages,
-medians, counts, or paid-price labels.
-
 ### `joongna_get_seller_evidence`
 
 Fetches one evidence result for every requested seller ID, including repeated
@@ -148,6 +122,10 @@ Common error codes include `invalid_query`, `cursor_mismatch`, `parse_failed`,
 rate limits, and appropriate upstream failures are retryable.
 
 ## Migration and limits
+
+Version `0.3.0` renames `joongna_search_keyword` to `joongna_search`, matching
+`bunjang_search`, and removes `joongna_search_price` along with the source
+price chart. The search input and output are unchanged.
 
 This is a versioned pagination and output migration. The old `max_listings` and
 `offset` inputs are removed and rejected rather than silently ignored. Search
