@@ -1133,7 +1133,7 @@ function buildServer(env: Env): McpServer {
     "joongna_search",
     {
       description:
-        "Search one native Joongna page. Defaults to 50 native results, details enabled, and no seller evidence. The cursor is opaque; no automatic page fill or offset pagination is performed.",
+        "Search one native Joongna page. Defaults to 50 native results, details enabled, and no seller evidence. Sold listings are excluded unless statuses includes `sold`. The cursor is opaque; no automatic page fill or offset pagination is performed.",
       inputSchema: SearchInputSchema,
       outputSchema: SearchOutputSchema,
     },
